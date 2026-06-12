@@ -7,6 +7,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import transformers
+import math
 from einops import rearrange
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
@@ -23,6 +24,32 @@ from models.beats.BEATs_wrapper import BEATsWrapper
 from models.frame_passt.fpasst_wrapper import FPaSSTWrapper
 from models.m2d.M2D_wrapper import M2DWrapper
 from models.prediction_wrapper import PredictionsWrapper
+
+try:
+    from transformers.optimization import (
+        get_cosine_schedule_with_warmup,
+        get_polynomial_decay_schedule_with_warmup,
+    )
+except ImportError:
+    def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
+        def lr_lambda(current_step):
+            if current_step < num_warmup_steps:
+                return float(current_step) / max(1, num_warmup_steps)
+            progress = float(current_step - num_warmup_steps) / max(1, num_training_steps - num_warmup_steps)
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    def get_polynomial_decay_schedule_with_warmup(
+        optimizer, num_warmup_steps, num_training_steps, power=1.0, lr_end=1e-7
+    ):
+        def lr_lambda(current_step):
+            if current_step < num_warmup_steps:
+                return float(current_step) / max(1, num_warmup_steps)
+            progress = float(current_step - num_warmup_steps) / max(1, num_training_steps - num_warmup_steps)
+            return max(lr_end, (1.0 - progress) ** power)
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 class PLModule(pl.LightningModule):
@@ -222,14 +249,14 @@ class PLModule(pl.LightningModule):
         if schedule_mode in {"exp"}:
             return torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma)
         if schedule_mode in {"cosine", "cos"}:
-            return transformers.get_cosine_schedule_with_warmup(
+            return get_cosine_schedule_with_warmup(
                 optimizer,
                 num_warmup_steps=num_warmup_steps,
                 num_training_steps=num_training_steps,
             )
         if schedule_mode in {"linear"}:
             print("Linear schedule!")
-            return transformers.get_polynomial_decay_schedule_with_warmup(
+            return get_polynomial_decay_schedule_with_warmup(
                 optimizer,
                 num_warmup_steps=num_warmup_steps,
                 num_training_steps=num_training_steps,
