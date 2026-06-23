@@ -1,4 +1,5 @@
 import argparse
+import csv
 import io
 import json
 import random
@@ -16,6 +17,7 @@ from tqdm import tqdm
 DEFAULT_AUDIOSET_PATH = Path("/data/AudioSet-Strong-Balanced")
 DEFAULT_OUTPUT_PATH = Path("/data/hear_datasets/tasks/audio_set_strong_street")
 DCASE_SPLIT_COUNTS = {"train": 44, "valid": 14, "test": 14}
+DEFAULT_NO_CROP_LABELS = ("Gunshot, gunfire", "Breaking")
 
 
 @dataclass
@@ -174,6 +176,7 @@ def collect_event_clips(
     max_clips_per_class: int,
     min_event_s: float,
     max_event_s: float,
+    no_crop_labels: set,
 ) -> Dict[str, List[EventClip]]:
     reader_name, reader_module = require_reader()
     if reader_name == "datasets":
@@ -235,12 +238,12 @@ def collect_event_clips(
             if duration_s <= 0:
                 continue
 
-            if duration_s > max_event_s:
+            if label not in no_crop_labels and duration_s > max_event_s:
                 center = 0.5 * (start_s + end_s)
                 start_s = max(0.0, center - max_event_s / 2)
                 end_s = min(len(audio) / target_sr, start_s + max_event_s)
                 duration_s = end_s - start_s
-            if duration_s < min_event_s:
+            if label not in no_crop_labels and duration_s < min_event_s:
                 pad = 0.5 * (min_event_s - duration_s)
                 start_s = max(0.0, start_s - pad)
                 end_s = min(len(audio) / target_sr, end_s + pad)
@@ -324,10 +327,11 @@ def synthesize_clip(
 
 
 def write_label_vocab(output_path: Path, label_to_idx: Dict[str, int]) -> None:
-    with output_path.joinpath("labelvocabulary.csv").open("w") as f:
-        f.write("idx,label\n")
+    with output_path.joinpath("labelvocabulary.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["idx", "label"])
         for label, idx in label_to_idx.items():
-            f.write(f"{idx},{label}\n")
+            writer.writerow([idx, label])
 
 
 def write_task_metadata(output_path: Path, args: argparse.Namespace) -> None:
@@ -388,8 +392,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_events", type=int, default=38)
     parser.add_argument("--min_gap", type=float, default=0.25)
     parser.add_argument("--max_gap", type=float, default=4.0)
-    parser.add_argument("--min_event_s", type=float, default=0.15)
-    parser.add_argument("--max_event_s", type=float, default=4.0)
+    parser.add_argument("--min_event_s", type=float, default=0.8)
+    parser.add_argument("--max_event_s", type=float, default=5.0)
+    parser.add_argument(
+        "--no_crop_labels",
+        nargs="*",
+        default=list(DEFAULT_NO_CROP_LABELS),
+        help="Labels whose source event intervals should not be expanded or truncated.",
+    )
     parser.add_argument("--max_source_clips_per_class", type=int, default=500)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument(
@@ -416,6 +426,7 @@ def main() -> None:
     args.output_path.mkdir(parents=True)
 
     mid_to_label, label_to_idx = load_street_classes(args.class_file)
+    no_crop_labels = set(args.no_crop_labels)
     write_label_vocab(args.output_path, label_to_idx)
     write_task_metadata(args.output_path, args)
 
@@ -428,6 +439,7 @@ def main() -> None:
         args.max_source_clips_per_class,
         args.min_event_s,
         args.max_event_s,
+        no_crop_labels,
     )
     print({label: len(clips) for label, clips in train_source.items()})
 
@@ -440,6 +452,7 @@ def main() -> None:
         args.max_source_clips_per_class,
         args.min_event_s,
         args.max_event_s,
+        no_crop_labels,
     )
     print({label: len(clips) for label, clips in test_source.items()})
 
