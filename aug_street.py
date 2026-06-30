@@ -29,6 +29,14 @@ class EventClip:
     source_id: str
 
 
+@dataclass
+class BackgroundClip:
+    audio: np.ndarray
+    sample_rate: int
+    duration_s: float
+    source_id: str
+
+
 def load_street_classes(path: Path) -> Tuple[Dict[str, str], Dict[str, int]]:
     mid_to_label = {}
     with path.open() as f:
@@ -137,6 +145,15 @@ def event_list(row: dict) -> List[dict]:
         names = events.get("event_name", [])
         return [{"start": s, "end": e, "event_name": n} for s, e, n in zip(starts, ends, names)]
     return list(events)
+
+
+def event_label_values(event: dict) -> List[str]:
+    values = []
+    for key in ("event_name", "label", "event_label", "human_label", "name"):
+        value = event.get(key)
+        if value:
+            values.append(str(value))
+    return values
 
 
 def useful_events_for_target(events: List[dict], human_labels: set, clip_duration_s: float) -> List[dict]:
@@ -266,6 +283,64 @@ def collect_event_clips(
     return clips_by_label
 
 
+def collect_background_clips(
+    source_path: Path,
+    split: str,
+    mid_to_label: Dict[str, str],
+    target_sr: int,
+    max_clips: int,
+) -> List[BackgroundClip]:
+    if max_clips <= 0:
+        return []
+
+    reader_name, reader_module = require_reader()
+    if reader_name == "datasets":
+        rows = iter_rows_with_datasets(source_path, split, reader_module)
+    else:
+        rows = iter_rows_with_pyarrow(source_path, split, reader_module)
+
+    wanted_mids = set(mid_to_label)
+    wanted_names = set(mid_to_label.values())
+    clips: List[BackgroundClip] = []
+
+    progress = tqdm(
+        rows,
+        desc=f"Collecting {split} background clips",
+        unit="row",
+        dynamic_ncols=True,
+    )
+    for row in progress:
+        row_labels = set(row.get("labels") or [])
+        human_labels = set(row.get("human_labels") or [])
+        if row_labels.intersection(wanted_mids) or human_labels.intersection(wanted_names):
+            continue
+
+        has_target_event = False
+        for event in event_list(row):
+            event_labels = set(event_label_values(event))
+            if event_labels.intersection(wanted_mids) or event_labels.intersection(wanted_names):
+                has_target_event = True
+                break
+        if has_target_event:
+            continue
+
+        audio, sr = row_audio_to_array(row["audio"])
+        audio = resample_if_needed(audio, sr, target_sr)
+        if audio.size == 0:
+            continue
+
+        source_id = str(row.get("video_id", "unknown"))
+        audio = normalize_background(audio)
+        clips.append(BackgroundClip(audio, target_sr, len(audio) / target_sr, source_id))
+        progress.set_postfix_str(f"clips={len(clips)}/{max_clips}")
+        if len(clips) >= max_clips:
+            break
+
+    if len(clips) < max_clips:
+        raise RuntimeError(f"Only found {len(clips)} background clips for {split}, requested {max_clips}")
+    return clips
+
+
 def source_clip_summary(clips_by_label: Dict[str, List[EventClip]], mid_to_label: Dict[str, str]) -> str:
     counts = [len(clips_by_label[label]) for label in mid_to_label.values()]
     return f"clips={sum(counts)} min_class={min(counts) if counts else 0} max_class={max(counts) if counts else 0}"
@@ -278,6 +353,47 @@ def normalize_event(audio: np.ndarray, peak: float = 0.85) -> np.ndarray:
     if max_abs > 1e-6:
         audio = audio / max_abs * peak
     return audio
+
+
+def normalize_background(audio: np.ndarray, peak: float = 0.85) -> np.ndarray:
+    audio = audio.astype(np.float32, copy=False)
+    audio = audio - float(np.mean(audio))
+    max_abs = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if max_abs > peak and max_abs > 1e-6:
+        audio = audio / max_abs * peak
+    return audio
+
+
+def synthesize_background_clip(
+    background_clips: List[BackgroundClip],
+    rng: random.Random,
+    sample_rate: int,
+    clip_len_s: float,
+) -> np.ndarray:
+    total_samples = int(round(clip_len_s * sample_rate))
+    output = np.zeros(total_samples, dtype=np.float32)
+    cursor = 0
+
+    while cursor < total_samples:
+        clip = rng.choice(background_clips).audio
+        if clip.size == 0:
+            continue
+        if clip.size > total_samples - cursor:
+            max_start = max(0, clip.size - (total_samples - cursor))
+            start = rng.randint(0, max_start) if max_start > 0 else 0
+            chunk = clip[start:start + (total_samples - cursor)]
+        else:
+            chunk = clip
+        end = min(total_samples, cursor + len(chunk))
+        output[cursor:end] = chunk[: end - cursor]
+        cursor = end
+
+    gain = 10 ** (rng.uniform(-9.0, -1.0) / 20.0)
+    output *= gain
+    max_abs = float(np.max(np.abs(output))) if output.size else 0.0
+    if max_abs > 0.99:
+        output = output / max_abs * 0.99
+    return output
 
 
 def synthesize_clip(
@@ -349,6 +465,7 @@ def generate_split(
     split: str,
     count: int,
     clips_by_label: Dict[str, List[EventClip]],
+    background_clips: List[BackgroundClip],
     output_path: Path,
     args: argparse.Namespace,
     rng: random.Random,
@@ -371,6 +488,20 @@ def generate_split(
         filename = f"{split}_{idx:06d}.wav"
         sf.write(audio_dir / filename, audio, args.sample_rate)
         annotations[filename] = events
+
+    background_count = int(round(count * args.background_ratio))
+    if background_count > 0 and not background_clips:
+        raise RuntimeError(f"Cannot generate {split} background negatives without background source clips")
+    for idx in range(background_count):
+        audio = synthesize_background_clip(
+            background_clips=background_clips,
+            rng=rng,
+            sample_rate=args.sample_rate,
+            clip_len_s=args.clip_len,
+        )
+        filename = f"{split}_background_{idx:06d}.wav"
+        sf.write(audio_dir / filename, audio, args.sample_rate)
+        annotations[filename] = []
 
     output_path.joinpath(f"{split}.json").write_text(json.dumps(annotations, indent=2) + "\n")
     return annotations
@@ -395,6 +526,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_event_s", type=float, default=0.8)
     parser.add_argument("--max_event_s", type=float, default=5.0)
     parser.add_argument(
+        "--background_ratio",
+        type=float,
+        default=0.25,
+        help="Additional pure-background negative clips per split, relative to the positive clip count.",
+    )
+    parser.add_argument(
+        "--max_background_source_clips",
+        type=int,
+        default=500,
+        help="Maximum non-target AudioSet clips to collect per source split for background negatives.",
+    )
+    parser.add_argument(
         "--no_crop_labels",
         nargs="*",
         default=list(DEFAULT_NO_CROP_LABELS),
@@ -414,6 +557,10 @@ def main() -> None:
     args = parse_args()
     rng = random.Random(args.seed)
 
+    if args.background_ratio < 0:
+        raise ValueError("--background_ratio must be >= 0")
+    if args.background_ratio > 0 and args.max_background_source_clips <= 0:
+        raise ValueError("--max_background_source_clips must be > 0 when --background_ratio is > 0")
     if not args.source_path.is_dir():
         raise FileNotFoundError(f"AudioSet source_path does not exist: {args.source_path}")
     if not args.class_file.is_file():
@@ -442,6 +589,15 @@ def main() -> None:
         no_crop_labels,
     )
     print({label: len(clips) for label, clips in train_source.items()})
+    train_background = collect_background_clips(
+        args.source_path,
+        "train",
+        mid_to_label,
+        args.sample_rate,
+        args.max_background_source_clips if args.background_ratio > 0 else 0,
+    )
+    if train_background:
+        print(f"Collected {len(train_background)} train/valid background clips")
 
     print(f"Collecting test source events from AudioSet test split: {args.source_path}")
     test_source = collect_event_clips(
@@ -455,15 +611,24 @@ def main() -> None:
         no_crop_labels,
     )
     print({label: len(clips) for label, clips in test_source.items()})
+    test_background = collect_background_clips(
+        args.source_path,
+        "test",
+        mid_to_label,
+        args.sample_rate,
+        args.max_background_source_clips if args.background_ratio > 0 else 0,
+    )
+    if test_background:
+        print(f"Collected {len(test_background)} test background clips")
 
     split_counts = {
         "train": args.train_count,
         "valid": args.valid_count,
         "test": args.test_count,
     }
-    generate_split("train", split_counts["train"], train_source, args.output_path, args, rng)
-    generate_split("valid", split_counts["valid"], train_source, args.output_path, args, rng)
-    generate_split("test", split_counts["test"], test_source, args.output_path, args, rng)
+    generate_split("train", split_counts["train"], train_source, train_background, args.output_path, args, rng)
+    generate_split("valid", split_counts["valid"], train_source, train_background, args.output_path, args, rng)
+    generate_split("test", split_counts["test"], test_source, test_background, args.output_path, args, rng)
 
     print(f"Wrote DCASE-style dataset to {args.output_path}")
     print(f"Train with: python ex_dcase2016task2.py --task_path={args.output_path} --model_name=ATST-F --pretrained=strong --lr_decay=0.95 --batch_size 32")
