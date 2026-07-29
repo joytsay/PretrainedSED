@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import h5py
 import numpy as np
 import pandas as pd
 import soundfile as sf
@@ -147,7 +148,8 @@ def get_training_dataset(
         sample_rate=16000,
         label_fps=25,
         wavmix_p=0.0,
-        random_crop=True
+        random_crop=True,
+        pseudo_labels_file=None,
 ):
     task_path = Path(task_path)
 
@@ -161,6 +163,8 @@ def get_training_dataset(
         dataset = RandomCropDataset(train_fold_data, audio_dir, sample_rate, label_fps, label_to_idx, nlabels)
     else:
         dataset = FixCropDataset(train_fold_data, audio_dir, sample_rate, label_fps, label_to_idx, nlabels)
+    if pseudo_labels_file is not None:
+        dataset = PseudoLabelDataset(dataset, pseudo_labels_file)
     if wavmix_p > 0:
         dataset = MixupDataset(dataset, rate=wavmix_p)
     return dataset
@@ -295,6 +299,8 @@ class MixupDataset(Dataset):
                 if len(x2) != target_len:
                     x2 = x2[:target_len]
                 y1, y2 = batch1[1], batch2[1]
+                p1 = batch1[4] if len(batch1) > 4 else None
+                p2 = batch2[4] if len(batch2) > 4 else None
                 l = np.random.beta(self.beta, self.beta)
                 l = max(l, 1. - l)
                 x1 = x1 - x1.mean()
@@ -302,9 +308,62 @@ class MixupDataset(Dataset):
                 x = (x1 * l + x2 * (1. - l))
                 x = x - x.mean()
                 y = (y1 * l + y2 * (1. - l))
+                if p1 is not None and p2 is not None:
+                    pseudo = p1 * l + p2 * (1. - l)
+                    return x, y, batch1[2], batch1[3], pseudo
                 return x, y, batch1[2], batch1[3]
             return self.dataset[index]
         return self.dataset[index]
+
+    def __len__(self):
+        return len(self.dataset)
+
+
+class PseudoLabelDataset(Dataset):
+    def __init__(self, dataset, pseudo_labels_file):
+        self.dataset = dataset
+        self.pseudo_labels_file = pseudo_labels_file
+        self._opened = None
+        self.ex2pseudo_idx = {}
+        with h5py.File(self.pseudo_labels_file, "r") as f:
+            for i, fname in enumerate(f["filenames"]):
+                key = fname.decode("UTF-8")
+                self.ex2pseudo_idx[key] = i
+                if key.endswith(".wav"):
+                    self.ex2pseudo_idx[key[:-4]] = i
+                if key.endswith(".mp3"):
+                    self.ex2pseudo_idx[key[:-4]] = i
+
+    @property
+    def pseudo_hdf5_file(self):
+        if self._opened is None:
+            self._opened = h5py.File(self.pseudo_labels_file, "r")
+        return self._opened
+
+    def __getitem__(self, index):
+        batch = self.dataset[index]
+        filename = batch[2]
+        key = Path(filename).stem
+        pseudo_idx = self.ex2pseudo_idx.get(filename, self.ex2pseudo_idx.get(key))
+        if pseudo_idx is None:
+            raise KeyError(f"Could not find pseudo labels for {filename!r}")
+        pseudo = torch.from_numpy(np.asarray(self.pseudo_hdf5_file["strong_logits"][pseudo_idx])).float()
+        pseudo = torch.sigmoid(pseudo)
+        target_shape = batch[1].shape
+        if pseudo.shape == target_shape:
+            pass
+        elif pseudo.T.shape == target_shape:
+            pseudo = pseudo.T
+        elif pseudo.ndim == 2 and pseudo.shape[0] == 1 and pseudo.shape[1] == target_shape[0]:
+            pseudo = pseudo.squeeze(0).unsqueeze(1).expand(target_shape)
+        elif pseudo.ndim == 1 and pseudo.shape[0] == target_shape[0]:
+            pseudo = pseudo.unsqueeze(1).expand(target_shape)
+        else:
+            raise RuntimeError(
+                f"Pseudo labels for {filename!r} have shape {tuple(pseudo.shape)}, "
+                f"expected {tuple(target_shape)}"
+            )
+        return batch + (pseudo,)
 
     def __len__(self):
         return len(self.dataset)
