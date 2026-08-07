@@ -62,6 +62,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment-name", type=str, default=None)
     parser.add_argument("--top-k", type=int, default=11)
     parser.add_argument(
+        "--pos-x",
+        choices=["left", "right"],
+        default="left",
+        help="Horizontal position of the confidence legend.",
+    )
+    parser.add_argument(
+        "--pos-y",
+        choices=["top", "bottom"],
+        default="top",
+        help="Vertical position of the confidence legend.",
+    )
+    parser.add_argument(
         "--font-scale",
         type=float,
         default=0.012,
@@ -423,6 +435,8 @@ def compose_frame(
     timeline_height: int,
     top_k: int,
     font,
+    pos_x: str = "left",
+    pos_y: str = "top",
 ) -> np.ndarray:
     image = Image.fromarray(frame_rgb)
     draw = ImageDraw.Draw(image)
@@ -435,8 +449,6 @@ def compose_frame(
     entries.sort(key=lambda item: item[1], reverse=True)
     entries = entries[:top_k]
 
-    left = 24
-    top = 24
     bar_width = 260
     text_height = font_text_height(draw, font)
     score_bbox = draw.textbbox((0, 0), "0.0000 (0.00%)", font=font)
@@ -452,6 +464,8 @@ def compose_frame(
     row_width = label_column_width + 18 + score_column_width
     block_width = max(bar_width, row_width)
     block_height = len(entries) * row_height + 8
+    left = 24 if pos_x == "left" else width - block_width - 36
+    top = 24 if pos_y == "top" else height - block_height - 12
     draw.rectangle(
         (left - 12, top - 12, left - 12 + block_width + 24, top - 12 + block_height),
         fill=(0, 0, 0),
@@ -633,6 +647,8 @@ def main() -> None:
                     timeline_height,
                     args.top_k,
                     font,
+                    args.pos_x,
+                    args.pos_y,
                 )
                 try:
                     writer.stdin.write(composed.tobytes())
