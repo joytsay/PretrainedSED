@@ -20,15 +20,16 @@ class FixCropDataset(Dataset):
                  sample_rate: int,
                  label_fps: int,
                  label_to_idx: Dict,
-                 nlabels: int):
-        self.clip_len = 120
+                 nlabels: int,
+                 clip_len: float):
+        self.clip_len = clip_len
         self.target_len = 10
-        self.pieces_per_clip = self.clip_len // self.target_len
+        self.pieces_per_clip = clip_pieces(self.clip_len, self.target_len)
         self.filenames = list(data.keys())
         self.audio_dir = audio_dir
         assert self.audio_dir.is_dir(), f"{audio_dir} is not a directory"
         self.sample_rate = sample_rate
-        # all files are 120 seconds long, split them into 12 x 10 second pieces
+        # Split every generated recording into non-overlapping 10-second pieces.
         self.pieces = []
         self.labels = []
         self.timestamps = []
@@ -36,7 +37,7 @@ class FixCropDataset(Dataset):
             self.pieces += [(filename, i) for i in range(self.pieces_per_clip)]
             labels = data[filename]
             frame_len = 1000 / label_fps
-            timestamps = np.arange(label_fps * self.clip_len) * frame_len + 0.5 * frame_len
+            timestamps = np.arange(round(label_fps * self.clip_len)) * frame_len + 0.5 * frame_len
             timestamp_labels = get_labels_for_timestamps(labels, timestamps)
             ys = []
             for timestamp_label in timestamp_labels:
@@ -58,11 +59,15 @@ class FixCropDataset(Dataset):
         filename = self.pieces[idx][0]
         piece = self.pieces[idx][1]
         audio_path = self.audio_dir.joinpath(filename)
-        audio, sr = sf.read(str(audio_path), dtype=np.float32)
-        assert sr == self.sample_rate
         start = self.sample_rate * piece * self.target_len
         end = start + self.sample_rate * self.target_len
-        audio = audio[start:end]
+        audio, sr = sf.read(
+            str(audio_path),
+            start=start,
+            stop=end,
+            dtype=np.float32,
+        )
+        assert sr == self.sample_rate
         return audio, self.labels[idx].transpose(0, 1), filename, self.timestamps[idx]
 
 
@@ -76,22 +81,23 @@ class RandomCropDataset(Dataset):
                  sample_rate: int,
                  label_fps: int,
                  label_to_idx: Dict,
-                 nlabels: int):
-        self.clip_len = 120
+                 nlabels: int,
+                 clip_len: float):
+        self.clip_len = clip_len
         self.target_len = 10
-        self.pieces_per_clip = self.clip_len // self.target_len
+        self.pieces_per_clip = clip_pieces(self.clip_len, self.target_len)
         self.filenames = list(data.keys())
         self.audio_dir = audio_dir
         assert self.audio_dir.is_dir(), f"{audio_dir} is not a directory"
         self.sample_rate = sample_rate
         self.label_fps = label_fps
-        # all files are 120 seconds long, randomly crop 10 seconds snippets
+        # Randomly crop 10-second snippets across the full generated recording.
         self.labels = []
         self.timestamps = []
         for filename in self.filenames:
             labels = data[filename]
             frame_len = 1000 / label_fps
-            timestamps = np.arange(label_fps * self.clip_len) * frame_len + 0.5 * frame_len
+            timestamps = np.arange(round(label_fps * self.clip_len)) * frame_len + 0.5 * frame_len
             timestamp_labels = get_labels_for_timestamps(labels, timestamps)
             ys = []
             for timestamp_label in timestamp_labels:
@@ -105,14 +111,12 @@ class RandomCropDataset(Dataset):
         assert len(self.labels) == len(self.filenames)
 
     def __len__(self):
-        return len(self.filenames) * self.clip_len // self.target_len
+        return len(self.filenames) * self.pieces_per_clip
 
     def __getitem__(self, idx):
         idx = idx % len(self.filenames)
         filename = self.filenames[idx]
         audio_path = self.audio_dir.joinpath(filename)
-        audio, sr = sf.read(str(audio_path), dtype=np.float32)
-        assert sr == self.sample_rate
 
         # crop random 10 seconds piece
         labels_to_pick = self.target_len * self.label_fps
@@ -120,9 +124,41 @@ class RandomCropDataset(Dataset):
         offset = torch.randint(max_offset, (1,)).item()
         labels = self.labels[idx][offset:offset + labels_to_pick]
         scale = self.sample_rate // self.label_fps
-        audio = audio[offset * scale:offset * scale + labels_to_pick * scale]
+        audio_start = offset * scale
+        audio_end = audio_start + labels_to_pick * scale
+        audio, sr = sf.read(
+            str(audio_path),
+            start=audio_start,
+            stop=audio_end,
+            dtype=np.float32,
+        )
+        assert sr == self.sample_rate
         timestamps = self.timestamps[idx][offset:offset + labels_to_pick]
         return audio, labels.transpose(0, 1), filename, timestamps
+
+
+def clip_pieces(clip_len: float, target_len: int) -> int:
+    pieces = int(round(clip_len / target_len))
+    if pieces <= 0 or not np.isclose(pieces * target_len, clip_len):
+        raise ValueError(
+            f"clip_length_seconds={clip_len} must be a positive multiple of {target_len}"
+        )
+    return pieces
+
+
+def task_clip_length(task_path: Path) -> float:
+    metadata_path = task_path / "task_metadata.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(
+            f"Missing {metadata_path}; clip duration can no longer be assumed to be 120 seconds"
+        )
+    metadata = json.load(metadata_path.open())
+    try:
+        clip_len = float(metadata["clip_length_seconds"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Missing or invalid clip_length_seconds in {metadata_path}") from exc
+    clip_pieces(clip_len, 10)
+    return clip_len
 
 
 def get_training_dataset(
@@ -136,14 +172,19 @@ def get_training_dataset(
 
     label_vocab, nlabels = label_vocab_nlabels(task_path)
     label_to_idx = label_vocab_as_dict(label_vocab, key="label", value="idx")
+    clip_len = task_clip_length(task_path)
 
     train_fold = task_path.joinpath("train.json")
     audio_dir = task_path.joinpath(str(sample_rate), "train")
     train_fold_data = json.load(train_fold.open())
     if random_crop:
-        dataset = RandomCropDataset(train_fold_data, audio_dir, sample_rate, label_fps, label_to_idx, nlabels)
+        dataset = RandomCropDataset(
+            train_fold_data, audio_dir, sample_rate, label_fps, label_to_idx, nlabels, clip_len
+        )
     else:
-        dataset = FixCropDataset(train_fold_data, audio_dir, sample_rate, label_fps, label_to_idx, nlabels)
+        dataset = FixCropDataset(
+            train_fold_data, audio_dir, sample_rate, label_fps, label_to_idx, nlabels, clip_len
+        )
     if wavmix_p > 0:
         dataset = MixupDataset(dataset, rate=wavmix_p)
     return dataset
@@ -158,11 +199,14 @@ def get_validation_dataset(
 
     label_vocab, nlabels = label_vocab_nlabels(task_path)
     label_to_idx = label_vocab_as_dict(label_vocab, key="label", value="idx")
+    clip_len = task_clip_length(task_path)
 
     valid_fold = task_path.joinpath("valid.json")
     audio_dir = task_path.joinpath(str(sample_rate), "valid")
     valid_fold_data = json.load(valid_fold.open())
-    dataset = FixCropDataset(valid_fold_data, audio_dir, sample_rate, label_fps, label_to_idx, nlabels)
+    dataset = FixCropDataset(
+        valid_fold_data, audio_dir, sample_rate, label_fps, label_to_idx, nlabels, clip_len
+    )
     return dataset
 
 
@@ -175,11 +219,14 @@ def get_test_dataset(
 
     label_vocab, nlabels = label_vocab_nlabels(task_path)
     label_to_idx = label_vocab_as_dict(label_vocab, key="label", value="idx")
+    clip_len = task_clip_length(task_path)
 
     test_fold = task_path.joinpath("test.json")
     audio_dir = task_path.joinpath(str(sample_rate), "test")
     test_fold_data = json.load(test_fold.open())
-    dataset = FixCropDataset(test_fold_data, audio_dir, sample_rate, label_fps, label_to_idx, nlabels)
+    dataset = FixCropDataset(
+        test_fold_data, audio_dir, sample_rate, label_fps, label_to_idx, nlabels, clip_len
+    )
     return dataset
 
 

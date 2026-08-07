@@ -200,6 +200,28 @@ This section presents the main results reported [in the paper](https://arxiv.org
 * All results represent averages over three independent runs.
 * For AudioSet Strong, we employ the threshold-independent PSDS1 [7] metric to ensure fine-grained temporal evaluation.
 
+## Custom dataset
+* quick evaluation hearnet style dataset from AS_Strong_Balanced
+```sh
+python aug_street.py --class_file street_bark.txt --output_path /data/hear_datasets/tasks/audio_set_strong_street_bark_4m_grouped_eval --eval --overwrite --overlap 0.1 --clip_len 240
+
+```
+* augment full hearnet style dataset from AS_Strong_Balanced
+```sh
+python aug_street.py --class_file street_bark.txt --output_path /data/hear_datasets/tasks/audio_set_strong_street_bark_4m_grouped --overwrite --overlap 0.1 --clip_len 240
+```
+
+* run refine training
+```sh
+python ex_dcase2016task2.py --task_path=/data/hear_datasets/tasks/audio_set_strong_street_bark_4m_grouped --model_name=ATST-F --pretrained=strong --lr_decay=0.95 --batch_size 32 --experiment_name AS_GROUP --n_classes 7 --wavmix_p 0 --mixup_p 0
+```
+
+* render video with 11 classes confidence
+```sh
+python render_sed_overlay_video.py --video videos/M16WithSilencerHasanM4upperForAllYouGamersLol_0YTieIiZNN4.mp4 --out output/M16WithSilencerHasanM4upperForAllYouGamersLol_0YTieIiZNN4_oxp.mp4 --ckpt PTSED/oxpir1dq/checkpoints/epoch\=299-step\=6300.ckpt --label-vocab /data/hear_datasets/tasks/audio_set_strong_street_boom_2m/labelvocabulary.csv  --n-classes 13
+```
+```
+
 
 ### Student Model Performances on AudioSet Strong (*from paper*)
 
@@ -317,4 +339,3 @@ To complement the simplified DESED setup presented earlier, we provide results f
 [7] J. Ebbers, R. Haeb-Umbach, and R. Serizel, “Threshold independent evaluation of sound event detection scores,” in Proceedings of the International Conference on Acoustics, Speech and Signal Processing (ICASSP), 2022.
 
 [8] N. Shao, X. Li, and X. Li, “Fine-tune the pretrained ATST model for sound event detection,” in Proceedings of the International Conference on Acoustics, Speech and Signal Processing (ICASSP), 2024
-

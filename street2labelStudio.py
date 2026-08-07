@@ -100,6 +100,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reviewed-only",
+        action="store_true",
+        help=(
+            "In reverse mode, include only tasks present in the Label Studio "
+            "export and copy only their WAV files."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Replace an existing reverse output directory.",
@@ -461,6 +469,7 @@ def merged_annotations(
     source: dict[str, dict[str, list[dict[str, Any]]]],
     reviewed: dict[tuple[str, str], list[dict[str, Any]]],
     drop_unreviewed: bool,
+    reviewed_only: bool = False,
 ) -> dict[str, dict[str, list[dict[str, Any]]]]:
     merged: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for split in SPLITS:
@@ -469,6 +478,8 @@ def merged_annotations(
             key = (split, filename)
             if key in reviewed:
                 merged[split][filename] = reviewed[key]
+            elif reviewed_only:
+                continue
             elif drop_unreviewed:
                 merged[split][filename] = []
             else:
@@ -503,7 +514,12 @@ def reverse(args: argparse.Namespace) -> None:
     source = read_source_annotations(source_dir)
     reviewed = read_export(export_path, args.audio_field)
     validate_reviewed_tasks(reviewed, source)
-    annotations = merged_annotations(source, reviewed, args.drop_unreviewed)
+    annotations = merged_annotations(
+        source,
+        reviewed,
+        args.drop_unreviewed,
+        args.reviewed_only,
+    )
     labels = read_label_vocab(source_dir)
     reviewed_labels = {
         event["label"]
@@ -524,8 +540,16 @@ def reverse(args: argparse.Namespace) -> None:
         )
         source_audio = source_dir / str(sample_rate) / split
         output_audio = output_dir / str(sample_rate) / split
-        output_audio.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source_audio, output_audio)
+        if args.reviewed_only:
+            output_audio.mkdir(parents=True, exist_ok=True)
+            for filename in annotations[split]:
+                source_wav = source_audio / filename
+                if not source_wav.is_file():
+                    raise FileNotFoundError(f"Missing source audio: {source_wav}")
+                shutil.copy2(source_wav, output_audio / filename)
+        else:
+            output_audio.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source_audio, output_audio)
 
     event_count = sum(
         len(events)
@@ -535,6 +559,7 @@ def reverse(args: argparse.Namespace) -> None:
     print(f"source_dataset={source_dir}")
     print(f"labelstudio_export={export_path}")
     print(f"reviewed_tasks={len(reviewed)}")
+    print(f"reviewed_only={args.reviewed_only}")
     print(f"events={event_count}")
     print(f"output_dir={output_dir}")
 

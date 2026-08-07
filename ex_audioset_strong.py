@@ -3,6 +3,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 import argparse
+from pathlib import Path
 import torch.nn as nn
 import wandb
 import transformers
@@ -25,6 +26,8 @@ from helpers.utils import worker_init_fn
 from data_util.audioset_strong import get_training_dataset, get_eval_dataset
 from data_util.audioset_strong import get_temporal_count_balanced_sample_weights, get_uniform_sample_weights, \
     get_weighted_sampler
+from data_util.audioset_street import get_training_dataset as get_street_training_dataset
+from data_util.audioset_street import get_validation_dataset as get_street_validation_dataset
 from data_util.audioset_classes import as_strong_train_classes, as_strong_eval_classes
 from models.frame_mn.Frame_MN_wrapper import FrameMNWrapper
 from models.frame_mn.utils import NAME_TO_WIDTH
@@ -73,33 +76,42 @@ class PLModule(pl.LightningModule):
         else:
             raise ValueError(f"Unknown pretrained checkpoint: {config.pretrained}")
 
+        n_classes_strong = len(encoder.labels)
+
         # load transformer model
         if config.model_name == "BEATs":
             beats = BEATsWrapper()
             model = PredictionsWrapper(beats, checkpoint=f"BEATs_{checkpoint}" if checkpoint else None,
-                                       seq_model_type=config.seq_model_type)
+                                       seq_model_type=config.seq_model_type,
+                                       n_classes_strong=n_classes_strong)
         elif config.model_name == "ATST-F":
             atst = ATSTWrapper()
             model = PredictionsWrapper(atst, checkpoint=f"ATST-F_{checkpoint}" if checkpoint else None,
-                                       seq_model_type=config.seq_model_type)
+                                       seq_model_type=config.seq_model_type,
+                                       n_classes_strong=n_classes_strong)
         elif config.model_name == "fpasst":
             fpasst = FPaSSTWrapper()
             model = PredictionsWrapper(fpasst, checkpoint=f"fpasst_{checkpoint}" if checkpoint else None,
-                                       seq_model_type=config.seq_model_type)
+                                       seq_model_type=config.seq_model_type,
+                                       n_classes_strong=n_classes_strong)
         elif config.model_name == "M2D":
             m2d = M2DWrapper()
             model = PredictionsWrapper(m2d, checkpoint=f"M2D_{checkpoint}" if checkpoint else None,
                                        seq_model_type=config.seq_model_type,
+                                       n_classes_strong=n_classes_strong,
                                        embed_dim=m2d.m2d.cfg.feature_d)
         elif config.model_name == "ASIT":
             asit = ASiTWrapper()
             model = PredictionsWrapper(asit, checkpoint=f"ASIT_{checkpoint}" if checkpoint else None,
-                                       seq_model_type=config.seq_model_type)
+                                       seq_model_type=config.seq_model_type,
+                                       n_classes_strong=n_classes_strong)
         elif config.model_name.startswith("frame_mn"):
             width = NAME_TO_WIDTH(config.model_name)
             frame_mn = FrameMNWrapper(width)
             embed_dim = frame_mn.state_dict()['frame_mn.features.16.1.bias'].shape[0]
-            model = PredictionsWrapper(frame_mn, checkpoint=f"{config.model_name}_strong_1", embed_dim=embed_dim)
+            model = PredictionsWrapper(frame_mn, checkpoint=f"{config.model_name}_strong_1",
+                                       n_classes_strong=n_classes_strong,
+                                       embed_dim=embed_dim)
         else:
             raise NotImplementedError(f"Model {config.model_name} not (yet) implemented")
 
@@ -118,8 +130,23 @@ class PLModule(pl.LightningModule):
         self.val_duration = {}
         self.val_loss = []
 
+    def unpack_batch(self, batch):
+        if isinstance(batch, dict):
+            return batch["audio"], batch["strong"], batch.get("pseudo_strong"), batch
+        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+            audio = batch[0]
+            strong = batch[1]
+            pseudo = batch[4] if len(batch) > 4 and torch.is_tensor(batch[4]) else None
+            return audio, strong, pseudo, batch
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
     def forward(self, batch):
-        x = batch["audio"]
+        if torch.is_tensor(batch):
+            x = batch
+        elif isinstance(batch, dict):
+            x = batch["audio"]
+        else:
+            x = batch[0]
         mel = self.model.mel_forward(x)
         y_strong, _ = self.model(mel)
         return y_strong
@@ -209,13 +236,8 @@ class PLModule(pl.LightningModule):
         :return: a dict containing at least loss that is used to update model parameters, can also contain
                     other items that can be processed in 'training_epoch_end' to log other metrics than loss
         """
-
-        x = train_batch["audio"]
-        labels = train_batch['strong']
-        if 'pseudo_strong' in train_batch:
-            pseudo_labels = train_batch['pseudo_strong']
-        else:
-            # create dummy pseudo labels
+        x, labels, pseudo_labels, _ = self.unpack_batch(train_batch)
+        if pseudo_labels is None:
             pseudo_labels = torch.zeros_like(labels)
             assert self.config.distillation_loss_weight == 0
 
@@ -291,22 +313,36 @@ class PLModule(pl.LightningModule):
         return loss
 
     def validation_step(self, val_batch, batch_idx):
+        x, y_strong, _, raw_batch = self.unpack_batch(val_batch)
+
+        if self.config.task_path:
+            y_hat_strong = self(x)
+            loss = self.strong_loss(y_hat_strong, y_strong)
+            self.val_loss.append(loss.detach().cpu())
+            return
+
+        if isinstance(raw_batch, dict):
+            filenames = raw_batch["filename"]
+            gt_strings = raw_batch["gt_string"]
+        else:
+            filenames = raw_batch[2]
+            gt_strings = raw_batch[3]
+
         # bring ground truth into shape needed for evaluation
-        for f, gt_string in zip(val_batch["filename"], val_batch["gt_string"]):
+        for f, gt_string in zip(filenames, gt_strings):
             f = f[:-len(".mp3")]
             events = [e.split(";;") for e in gt_string.split("++")]
             self.val_ground_truth[f] = [(float(e[0]), float(e[1]), e[2]) for e in events]
             self.val_duration[f] = self.val_durations_df[self.val_durations_df["filename"] == f]["duration"].values[0]
 
-        y_hat_strong = self(val_batch)
-        y_strong = val_batch["strong"]
+        y_hat_strong = self(x)
 
         loss = self.strong_loss(y_hat_strong, y_strong)
         self.val_loss.append(loss.cpu())
 
         scores_raw, scores_postprocessed, prediction_dfs = batched_decode_preds(
             y_hat_strong.float(),
-            val_batch['filename'],
+            filenames,
             self.encoder,
             median_filter=self.config.median_window
         )
@@ -316,6 +352,12 @@ class PLModule(pl.LightningModule):
         )
 
     def on_validation_epoch_end(self):
+        if self.config.task_path:
+            logs = {"val/loss": torch.as_tensor(self.val_loss).mean().to(self.device)}
+            self.log_dict(logs, sync_dist=False)
+            self.val_loss = []
+            return
+
         gt_unique_events = set([e[2] for f, events in self.val_ground_truth.items() for e in events])
         train_unique_events = set(self.encoder.labels)
         # evaluate on all classes that are in both train and test sets (407 classes)
@@ -393,31 +435,64 @@ def train(config):
     )
 
     # encoder manages encoding and decoding of model predictions
-    encoder = ManyHotEncoder(as_strong_train_classes)
-
-    train_set = get_training_dataset(encoder, wavmix_p=config.wavmix_p,
-                                     pseudo_labels_file=config.pseudo_labels_file)
-    eval_set = get_eval_dataset(encoder)
+    if config.task_path:
+        label_vocab = pd.read_csv(Path(config.task_path).joinpath("labelvocabulary.csv"))
+        labels = label_vocab.sort_values("idx")["label"].astype(str).tolist()
+        encoder = ManyHotEncoder(labels)
+        train_set = get_street_training_dataset(
+            config.task_path,
+            sample_rate=config.sample_rate,
+            label_fps=config.label_fps,
+            wavmix_p=config.wavmix_p,
+            random_crop=True,
+            pseudo_labels_file=config.pseudo_labels_file,
+        )
+        eval_set = get_street_validation_dataset(
+            config.task_path,
+            sample_rate=config.sample_rate,
+            label_fps=config.label_fps,
+        )
+    else:
+        encoder = ManyHotEncoder(as_strong_train_classes)
+        train_set = get_training_dataset(encoder, wavmix_p=config.wavmix_p,
+                                         pseudo_labels_file=config.pseudo_labels_file)
+        eval_set = get_eval_dataset(encoder)
 
     if config.use_balanced_sampler:
         sample_weights = get_temporal_count_balanced_sample_weights(train_set, save_folder="resources")
     else:
         sample_weights = get_uniform_sample_weights(train_set)
 
-    train_sampler = get_weighted_sampler(sample_weights, epoch_len=config.epoch_len)
+    if config.task_path:
+        epoch_len = config.task_epoch_len if config.task_epoch_len is not None else len(train_set)
+        num_workers = min(config.num_workers, config.task_num_workers)
+        print(
+            f"Using task_path dataloader settings: epoch_len={epoch_len}, "
+            f"num_workers={num_workers}, train_size={len(train_set)}"
+        )
+    else:
+        epoch_len = config.epoch_len
+        num_workers = config.num_workers
+
+    sampler_replace = epoch_len > len(train_set)
+    train_sampler = get_weighted_sampler(
+        sample_weights,
+        epoch_len=epoch_len,
+        sampler_replace=sampler_replace,
+    )
 
     # train dataloader
     train_dl = DataLoader(dataset=train_set,
                           sampler=train_sampler,
                           worker_init_fn=worker_init_fn,
-                          num_workers=config.num_workers,
+                          num_workers=num_workers,
                           batch_size=config.batch_size,
                           shuffle=False)
 
     # eval dataloader
     eval_dl = DataLoader(dataset=eval_set,
                          worker_init_fn=worker_init_fn,
-                         num_workers=config.num_workers,
+                         num_workers=num_workers,
                          batch_size=config.batch_size)
 
     # create pytorch lightening module
@@ -443,8 +518,18 @@ def train(config):
 def evaluate(config):
     # only evaluation of pre-trained models
     # encoder manages encoding and decoding of model predictions
-    encoder = ManyHotEncoder(as_strong_train_classes)
-    eval_set = get_eval_dataset(encoder)
+    if config.task_path:
+        label_vocab = pd.read_csv(Path(config.task_path).joinpath("labelvocabulary.csv"))
+        labels = label_vocab.sort_values("idx")["label"].astype(str).tolist()
+        encoder = ManyHotEncoder(labels)
+        eval_set = get_street_validation_dataset(
+            config.task_path,
+            sample_rate=config.sample_rate,
+            label_fps=config.label_fps,
+        )
+    else:
+        encoder = ManyHotEncoder(as_strong_train_classes)
+        eval_set = get_eval_dataset(encoder)
 
     # eval dataloader
     eval_dl = DataLoader(dataset=eval_set,
@@ -523,6 +608,13 @@ if __name__ == '__main__':
     # knowledge distillation
     parser.add_argument('--pseudo_labels_file', type=str,
                         default=None)
+    parser.add_argument('--task_path', type=str, default=None)
+    parser.add_argument('--sample_rate', type=int, default=16000)
+    parser.add_argument('--label_fps', type=int, default=25)
+    parser.add_argument('--task_epoch_len', type=int, default=None,
+                        help='Epoch length for --task_path datasets. Defaults to len(train_set).')
+    parser.add_argument('--task_num_workers', type=int, default=2,
+                        help='Maximum dataloader workers used with --task_path datasets.')
 
     args = parser.parse_args()
     if args.evaluate:
