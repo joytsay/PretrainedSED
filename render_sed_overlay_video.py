@@ -8,14 +8,16 @@ The output video includes:
 """
 
 import argparse
+import copy
 import csv
+import gc
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
-import shutil
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -32,10 +34,36 @@ DEFAULT_LABEL_TSV = REPO_ROOT / "mid_street_surveillance_10.tsv"
 DEFAULT_MID_TO_DISPLAY = REPO_ROOT / "mid_to_display_name.tsv"
 DEFAULT_COMMON_LABELS = REPO_ROOT / "common_labels.txt"
 
+# Gradio comparison labels. Change these two names to update the buttons,
+# result players, progress messages, and checkpoint lookup keys together.
+BASELINE = "ATST-F_strong_1"
+ABLATION = "e3jatho"
+GRADIO_MODELS = [BASELINE, ABLATION]
+
+GRADIO_CHECKPOINTS = {
+    BASELINE: {
+        "checkpoint": REPO_ROOT / "resources" / "ATST-F_strong_1.pt",
+        "label_vocab": REPO_ROOT / "mid_to_display_name.tsv",
+        "n_classes": 447,
+        "top_k": 13,
+    },
+    ABLATION: {
+        "checkpoint": REPO_ROOT / "PTSED" / "e3jathho" / "checkpoints" / "epoch=299-step=5400.ckpt",
+        "label_vocab": REPO_ROOT / "PTSED" / "e3jathho" / "labelvocabulary.csv",
+        "n_classes": 13,
+        "top_k": 13,
+    },
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render SED overlay video.")
-    parser.add_argument("--video", type=Path, required=True)
+    parser.add_argument(
+        "--video",
+        type=Path,
+        default=None,
+        help="Input video (required unless --gradio is used).",
+    )
     parser.add_argument("--ckpt", type=Path, default=DEFAULT_CKPT)
     parser.add_argument("--label-tsv", type=Path, default=None, help="Optional subset of labels to render.")
     parser.add_argument(
@@ -64,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pos-x",
         choices=["left", "right"],
-        default="left",
+        default="right",
         help="Horizontal position of the confidence legend.",
     )
     parser.add_argument(
@@ -79,6 +107,12 @@ def parse_args() -> argparse.Namespace:
         default=0.012,
         help="Font size as a fraction of frame width for the confidence overlay.",
     )
+    parser.add_argument("--gradio", action="store_true", help="Launch the Gradio web interface.")
+    parser.add_argument("--videos-dir", type=Path, default=REPO_ROOT / "videos")
+    parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "output")
+    parser.add_argument("--server-name", default="0.0.0.0")
+    parser.add_argument("--server-port", type=int, default=7860)
+    parser.add_argument("--share", action="store_true", help="Ask Gradio to create a public share URL.")
     return parser.parse_args()
 
 
@@ -206,10 +240,18 @@ def class_names_from_label_vocab(path: Path) -> list[str]:
     for raw_index, name in rows:
         try:
             index = int(raw_index)
-        except ValueError as exc:
-            raise ValueError(
-                f"Label vocabulary {path} has a non-integer idx value: {raw_index!r}"
-            ) from exc
+        except ValueError:
+            # AudioSet's MID-to-display-name file is not itself ordered like the
+            # model head. Use it to validate and name the known 447-output order.
+            mapped_names = {display_name for _, display_name in rows}
+            model_names = pretrained_sed_class_names()
+            missing_names = [name for name in model_names if name not in mapped_names]
+            if missing_names:
+                raise ValueError(
+                    f"MID mapping {path} is missing {len(missing_names)} model labels: "
+                    + ", ".join(missing_names[:5])
+                )
+            return model_names
         indexed_names.append((index, name))
 
     indexed_names.sort(key=lambda item: item[0])
@@ -262,7 +304,7 @@ def read_mid_to_display_name(path: Path) -> dict[str, str]:
     return mid_to_name
 
 
-def pretrained_sed_class_names() -> list[tuple[str, str]]:
+def pretrained_sed_class_names() -> list[str]:
     return list(as_strong_train_classes)
 
 
@@ -540,9 +582,11 @@ def open_video_writer(output_path: Path, width: int, height: int, fps: float, au
         "-i",
         str(audio_path),
         "-c:v",
-        "mpeg4",
-        "-q:v",
-        "3",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "18",
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -553,26 +597,28 @@ def open_video_writer(output_path: Path, width: int, height: int, fps: float, au
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
-def main() -> None:
-    args = PARSED_ARGS or parse_args()
+def prepare_render(args: argparse.Namespace) -> tuple[nn.Module, list[int], list[str]]:
+    """Load the model and resolve the ordered labels once."""
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
-    ckpt_tag = args.ckpt.stem
-    output_path = (
-        args.out
-        or args.video.with_name(f"{args.video.stem}__{ckpt_tag}__sed_overlay.mp4")
-    ).resolve()
     task_spec = get_task_spec(args.task)
     if args.task_path is None:
         args.task_path = task_spec["default_task_path"]
     if args.label_vocab is not None:
         task_class_names = class_names_from_label_vocab(args.label_vocab)
         vocabulary_description = str(args.label_vocab)
-    else:
+    elif (Path(args.task_path) / "labelvocabulary.csv").exists():
         label_vocab, _ = task_spec["label_vocab_nlabels"](Path(args.task_path))
         label_vocab = label_vocab.sort_values("idx")
         task_class_names = list(label_vocab["label"].astype(str))
         vocabulary_description = str(Path(args.task_path) / "labelvocabulary.csv")
+    elif is_pretrained_audioset_ckpt(args.ckpt):
+        task_class_names = pretrained_sed_class_names()
+        vocabulary_description = "the built-in AudioSet Strong vocabulary"
+    else:
+        raise FileNotFoundError(
+            f"No label vocabulary found under {args.task_path}. Pass --label-vocab for this checkpoint."
+        )
 
     model = load_render_model(args)
     if len(task_class_names) != model.num_labels:
@@ -590,11 +636,35 @@ def main() -> None:
             task_class_names,
             model.num_labels,
         )
+    return model, class_indices, class_names
+
+
+def render_video(
+    args: argparse.Namespace,
+    model: nn.Module,
+    class_indices: list[int],
+    class_names: list[str],
+    video_path: Path,
+    output_path: Path,
+    progress=None,
+) -> Path:
+    """Run SED inference and render a browser-compatible overlay video."""
+    video_path = Path(video_path).resolve()
+    output_path = Path(output_path).resolve()
+    if not video_path.is_file():
+        raise FileNotFoundError(f"Input video does not exist: {video_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def report(fraction: float, description: str) -> None:
+        if progress is not None:
+            progress(fraction, desc=description)
 
     with tempfile.TemporaryDirectory(prefix="sed_overlay_") as tmp_dir:
         audio_path = Path(tmp_dir) / "audio.wav"
-        extract_audio(args.video, audio_path)
+        report(0.01, "Extracting audio")
+        extract_audio(video_path, audio_path)
         wav = load_audio(audio_path)
+        report(0.05, "Running sound-event detection")
         predictions = run_inference(model, wav, args.device)[0, class_indices].numpy()
         print("selected_labels=" + ", ".join(
             f"{index}:{name}" for index, name in zip(class_indices, class_names)
@@ -604,7 +674,7 @@ def main() -> None:
             f"mean={float(predictions.mean()):.4f} max={float(predictions.max()):.4f}"
         )
 
-        meta = ffprobe_video(args.video)
+        meta = ffprobe_video(video_path)
         frame_width = meta["width"]
         frame_height = meta["height"]
         fps = meta["fps"]
@@ -620,7 +690,8 @@ def main() -> None:
         font_size = max(10, int(frame_width * args.font_scale))
         font = load_font(font_size)
 
-        reader = open_video_reader(args.video, frame_width, frame_height)
+        report(0.12, "Preparing overlays")
+        reader = open_video_reader(video_path, frame_width, frame_height)
         writer = open_video_writer(output_path, frame_width, frame_height, fps, audio_path)
         reader_stderr = b""
         writer_stderr = b""
@@ -663,6 +734,8 @@ def main() -> None:
                         "ffmpeg video writer exited early while receiving frames:\n"
                         + writer_stderr.decode("utf-8", errors="replace")
                     ) from exc
+                if frame_index % max(1, int(fps)) == 0:
+                    report(0.15 + 0.84 * (frame_index + 1) / frame_count, "Rendering video")
         finally:
             if reader.stdout:
                 reader.stdout.close()
@@ -690,12 +763,292 @@ def main() -> None:
         if not output_path.exists():
             raise FileNotFoundError(f"Expected output was not created: {output_path}")
 
-    print(f"video={args.video}")
+    report(1.0, "Done")
+    print(f"video={video_path}")
     print(f"ckpt={args.ckpt}")
     print(f"label_vocab={args.label_vocab}")
     print(f"label_tsv={args.label_tsv}")
     print(f"classes={len(class_names)}")
     print(f"output={output_path}")
+    return output_path
+
+
+def discover_example_videos(videos_dir: Path) -> list[Path]:
+    extensions = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+    if not videos_dir.is_dir():
+        return []
+    return sorted(
+        (
+            path.resolve()
+            for path in videos_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in extensions
+        ),
+        key=lambda path: path.name.lower(),
+    )
+
+
+def launch_gradio(args: argparse.Namespace) -> None:
+    try:
+        import gradio as gr
+    except ImportError as exc:
+        raise RuntimeError("Gradio is not installed. Run: pip install gradio") from exc
+
+    examples = discover_example_videos(args.videos_dir.resolve())
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    baseline_name, ablation_name = GRADIO_MODELS
+    model_cache = {"name": None, "bundle": None}
+
+    def get_renderer(checkpoint_name: str):
+        if checkpoint_name not in GRADIO_CHECKPOINTS:
+            raise ValueError(f"Unknown checkpoint selection: {checkpoint_name}")
+        if model_cache["name"] == checkpoint_name:
+            return model_cache["bundle"]
+
+        old_bundle = model_cache["bundle"]
+        if old_bundle is not None:
+            old_bundle[1].to("cpu")
+            model_cache["name"] = None
+            model_cache["bundle"] = None
+            del old_bundle
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        preset = GRADIO_CHECKPOINTS[checkpoint_name]
+        checkpoint_path = Path(preset["checkpoint"])
+        label_vocab_path = Path(preset["label_vocab"])
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
+        if not label_vocab_path.is_file():
+            raise FileNotFoundError(f"Label vocabulary does not exist: {label_vocab_path}")
+
+        render_args = copy.copy(args)
+        render_args.ckpt = checkpoint_path
+        render_args.label_vocab = label_vocab_path
+        render_args.n_classes = int(preset["n_classes"])
+        render_args.top_k = int(preset["top_k"])
+        model, class_indices, class_names = prepare_render(render_args)
+        bundle = (render_args, model, class_indices, class_names)
+        model_cache["name"] = checkpoint_name
+        model_cache["bundle"] = bundle
+        return bundle
+
+    def render_preset(video, checkpoint_name, progress):
+        if not video:
+            raise ValueError("Choose or upload a video first.")
+        render_args, model, class_indices, class_names = get_renderer(checkpoint_name)
+        source = Path(video)
+        output = output_dir / f"{source.stem}__{render_args.ckpt.stem}__sed_overlay.mp4"
+        return str(
+            render_video(
+                render_args,
+                model,
+                class_indices,
+                class_names,
+                source,
+                output,
+                progress,
+            )
+        )
+
+    def render_baseline_ui(video, progress=gr.Progress()):
+        try:
+            return render_preset(video, baseline_name, progress)
+        except Exception as exc:
+            raise gr.Error(str(exc)) from exc
+
+    def render_ablation_ui(video, progress=gr.Progress()):
+        try:
+            return render_preset(video, ablation_name, progress)
+        except Exception as exc:
+            raise gr.Error(str(exc)) from exc
+
+    def render_both_ui(video, progress=gr.Progress()):
+        if not video:
+            raise gr.Error("Choose or upload a video first.")
+        try:
+            baseline_progress = lambda fraction, desc=None: progress(
+                fraction * 0.5,
+                desc=f"{baseline_name}: {desc or 'working'}",
+            )
+            ablation_progress = lambda fraction, desc=None: progress(
+                0.5 + fraction * 0.5,
+                desc=f"{ablation_name}: {desc or 'working'}",
+            )
+            baseline_output = render_preset(video, baseline_name, baseline_progress)
+            ablation_output = render_preset(video, ablation_name, ablation_progress)
+            return baseline_output, ablation_output
+        except Exception as exc:
+            raise gr.Error(str(exc)) from exc
+
+    with gr.Blocks(title="PretrainedSED Video Overlay") as demo:
+        gr.Markdown(
+            "# Sound Event Detection (SED) Video Overlay\n"
+            "Choose one of the repository videos below or upload your own, then render the SED overlay."
+        )
+        with gr.Row():
+            with gr.Column(scale=1):
+                input_video = gr.Video(
+                    label="Input video",
+                    sources=["upload"],
+                    include_audio=True,
+                )
+            with gr.Column(scale=1):
+                if examples:
+                    gr.Examples(
+                        examples=[[str(path)] for path in examples],
+                        inputs=input_video,
+                        label=f"Example videos from {args.videos_dir.resolve()}",
+                        examples_per_page=20,
+                    )
+                else:
+                    gr.Markdown(f"No example videos found in `{args.videos_dir.resolve()}`.")
+        with gr.Row():
+            render_both_button = gr.Button("1. Render both", variant="primary")
+            render_baseline_button = gr.Button(f"2. Render baseline {baseline_name}")
+            render_ablation_button = gr.Button(f"3. Render ablation {ablation_name}")
+        with gr.Row():
+            baseline_output_video = gr.Video(
+                label=f"Baseline {baseline_name} result",
+                format="mp4",
+                interactive=False,
+                elem_id="baseline-output-video",
+            )
+            ablation_output_video = gr.Video(
+                label=f"Ablation {ablation_name} result",
+                format="mp4",
+                interactive=False,
+                elem_id="ablation-output-video",
+            )
+        with gr.Row():
+            match_ablation_button = gr.Button("Match time to ablation")
+            match_baseline_button = gr.Button("Match time to baseline")
+        match_baseline_button.click(
+            fn=None,
+            queue=False,
+            js="""
+            () => {
+                const baseline = document.querySelector('#baseline-output-video video');
+                const ablation = document.querySelector('#ablation-output-video video');
+                if (!baseline || !ablation) {
+                    alert('Render both videos before matching their playheads.');
+                    return [];
+                }
+                ablation.currentTime = baseline.currentTime;
+                return [];
+            }
+            """,
+        )
+        match_ablation_button.click(
+            fn=None,
+            queue=False,
+            js="""
+            () => {
+                const baseline = document.querySelector('#baseline-output-video video');
+                const ablation = document.querySelector('#ablation-output-video video');
+                if (!baseline || !ablation) {
+                    alert('Render both videos before matching their playheads.');
+                    return [];
+                }
+                baseline.currentTime = ablation.currentTime;
+                return [];
+            }
+            """,
+        )
+        with gr.Row():
+            play_both_button = gr.Button("▶️ Play")
+            pause_both_button = gr.Button("⏸️ Pause")
+            restart_both_button = gr.Button("⏮️ Replay")
+        play_both_button.click(
+            fn=None,
+            queue=False,
+            js="""
+            () => {
+                const baseline = document.querySelector('#baseline-output-video video');
+                const ablation = document.querySelector('#ablation-output-video video');
+                if (!baseline || !ablation) {
+                    alert('Render both videos before controlling playback.');
+                    return [];
+                }
+                baseline.muted = true;
+                ablation.muted = false;
+                baseline.play();
+                ablation.play();
+                return [];
+            }
+            """,
+        )
+        pause_both_button.click(
+            fn=None,
+            queue=False,
+            js="""
+            () => {
+                const baseline = document.querySelector('#baseline-output-video video');
+                const ablation = document.querySelector('#ablation-output-video video');
+                if (!baseline || !ablation) {
+                    alert('Render both videos before controlling playback.');
+                    return [];
+                }
+                baseline.pause();
+                ablation.pause();
+                return [];
+            }
+            """,
+        )
+        restart_both_button.click(
+            fn=None,
+            queue=False,
+            js="""
+            () => {
+                const baseline = document.querySelector('#baseline-output-video video');
+                const ablation = document.querySelector('#ablation-output-video video');
+                if (!baseline || !ablation) {
+                    alert('Render both videos before controlling playback.');
+                    return [];
+                }
+                baseline.currentTime = 0;
+                ablation.currentTime = 0;
+                return [];
+            }
+            """,
+        )
+        render_both_button.click(
+            render_both_ui,
+            inputs=input_video,
+            outputs=[baseline_output_video, ablation_output_video],
+        )
+        render_baseline_button.click(
+            render_baseline_ui,
+            inputs=input_video,
+            outputs=baseline_output_video,
+        )
+        render_ablation_button.click(
+            render_ablation_ui,
+            inputs=input_video,
+            outputs=ablation_output_video,
+        )
+    demo.queue(default_concurrency_limit=1).launch(
+        server_name=args.server_name,
+        server_port=args.server_port,
+        share=args.share,
+        allowed_paths=[str(args.videos_dir.resolve()), str(output_dir)],
+    )
+
+
+def main() -> None:
+    args = PARSED_ARGS or parse_args()
+    if args.gradio:
+        launch_gradio(args)
+        return
+    if args.video is None:
+        raise SystemExit("--video is required unless --gradio is used")
+    model, class_indices, class_names = prepare_render(args)
+    output_path = (
+        args.out
+        or args.video.with_name(f"{args.video.stem}__{args.ckpt.stem}__sed_overlay.mp4")
+    )
+    render_video(args, model, class_indices, class_names, args.video, output_path)
 
 
 if __name__ == "__main__":
