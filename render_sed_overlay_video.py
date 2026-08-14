@@ -989,6 +989,9 @@ def launch_gradio(args: argparse.Namespace) -> None:
                     _last_used_html(),
                     elem_id="last-used-status",
                 )
+        # Refresh every connected client's display from the process-global state.
+        last_used_timer = gr.Timer(1.0)
+        last_used_timer.tick(_last_used_html, outputs=last_used_html, show_progress="hidden")
         with gr.Row():
             with gr.Column(scale=1):
                 input_video = gr.Video(
