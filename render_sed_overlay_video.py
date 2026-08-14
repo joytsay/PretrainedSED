@@ -19,11 +19,74 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+from datetime import datetime
+from time import perf_counter
 from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+_TAIPEI_TIMEZONE = ZoneInfo("Asia/Taipei")
+_LAST_USED_LOCK = threading.Lock()
+_LAST_USED_STATE: dict[str, str | None] = {
+    "ip": None,
+    "action": None,
+    "time": None,
+    "duration": None,
+}
+
+
+def _last_used_html() -> str:
+    with _LAST_USED_LOCK:
+        ip = _LAST_USED_STATE["ip"]
+        action = _LAST_USED_STATE["action"]
+        used_at = _LAST_USED_STATE["time"]
+        duration = _LAST_USED_STATE["duration"]
+
+    if ip is None or action is None or used_at is None or duration is None:
+        return "<span>Last used: never</span>"
+    return (
+        f"<span>Last used by <strong>{html.escape(ip)}"
+        f" · {html.escape(action)}"
+        f" · {html.escape(duration)}</strong>"
+        f" · {html.escape(used_at)}</span>"
+    )
+
+
+def _request_ip(request: Any) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        return forwarded_for.split(",", 1)[0].strip()
+
+    real_ip = request.headers.get("x-real-ip", "").strip()
+    if real_ip:
+        return real_ip
+
+    client = getattr(request, "client", None)
+    return str(getattr(client, "host", None) or "unknown")
+
+
+def _record_last_used(action: str, request: Any, duration_s: float) -> str:
+    with _LAST_USED_LOCK:
+        _LAST_USED_STATE["ip"] = _request_ip(request)
+        _LAST_USED_STATE["action"] = action
+        _LAST_USED_STATE["time"] = datetime.now(_TAIPEI_TIMEZONE).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        _LAST_USED_STATE["duration"] = f"used {duration_s:.1f} sec"
+    return _last_used_html()
+
+
+def _run_recorded_action(action: str, request: Any, function: Any, *args: Any) -> Any:
+    started_at = perf_counter()
+    try:
+        return function(*args)
+    finally:
+        _record_last_used(action, request, perf_counter() - started_at)
 
 TARGET_SAMPLE_RATE = 16000
 SEGMENT_DURATION = 10.0
@@ -886,41 +949,46 @@ def launch_gradio(args: argparse.Namespace) -> None:
             )
         )
 
-    def render_baseline_ui(video, progress=gr.Progress()):
+    def render_baseline_ui(video, request: gr.Request, progress=gr.Progress()):
         try:
-            return render_preset(video, baseline_name, progress)
+            result = _run_recorded_action(
+                f"baseline {baseline_name}",
+                request,
+                render_preset,
+                video,
+                baseline_name,
+                progress,
+            )
+            return result, _last_used_html()
         except Exception as exc:
             raise gr.Error(str(exc)) from exc
 
-    def render_ablation_ui(video, progress=gr.Progress()):
+    def render_ablation_ui(video, request: gr.Request, progress=gr.Progress()):
         try:
-            return render_preset(video, ablation_name, progress)
-        except Exception as exc:
-            raise gr.Error(str(exc)) from exc
-
-    def render_both_ui(video, progress=gr.Progress()):
-        if not video:
-            raise gr.Error("Choose or upload a video first.")
-        try:
-            baseline_progress = lambda fraction, desc=None: progress(
-                fraction * 0.5,
-                desc=f"{baseline_name}: {desc or 'working'}",
+            result = _run_recorded_action(
+                f"ablation {ablation_name}",
+                request,
+                render_preset,
+                video,
+                ablation_name,
+                progress,
             )
-            ablation_progress = lambda fraction, desc=None: progress(
-                0.5 + fraction * 0.5,
-                desc=f"{ablation_name}: {desc or 'working'}",
-            )
-            baseline_output = render_preset(video, baseline_name, baseline_progress)
-            ablation_output = render_preset(video, ablation_name, ablation_progress)
-            return baseline_output, ablation_output
+            return result, _last_used_html()
         except Exception as exc:
             raise gr.Error(str(exc)) from exc
 
     with gr.Blocks(title="PretrainedSED Video Overlay") as demo:
-        gr.Markdown(
-            "# Sound Event Detection (SED) Video Overlay\n"
-            "Choose one of the repository videos below or upload your own, then render the SED overlay."
-        )
+        with gr.Row():
+            with gr.Column(scale=4):
+                gr.Markdown(
+                    "# Sound Event Detection (SED) Video Overlay\n"
+                    "Choose one of the repository videos below or upload your own, then render the SED overlay."
+                )
+            with gr.Column(scale=1, min_width=260):
+                last_used_html = gr.HTML(
+                    _last_used_html(),
+                    elem_id="last-used-status",
+                )
         with gr.Row():
             with gr.Column(scale=1):
                 input_video = gr.Video(
@@ -945,14 +1013,26 @@ def launch_gradio(args: argparse.Namespace) -> None:
         with gr.Row():
             with gr.Column(scale=1):
                 baseline_label_path = Path(GRADIO_CHECKPOINTS[baseline_name]["label_vocab"])
-                gr.Markdown(f"### {baseline_name} : {len(read_label_tsv(baseline_label_path))} labels")
+                gr.Markdown(
+                    f"### {baseline_name} :   "
+                    f"<mark style=\"background:var(--button-primary-background-fill);"
+                    f"color:var(--button-primary-text-color);padding:0.4em 0.4em;"
+                    f"margin-left:0.3em;border-radius:999px;\">"
+                    f"{len(pretrained_sed_class_names())} labels</mark>"
+                )
                 gr.HTML(label_badges_html(
                     baseline_label_path,
                     pretrained_sed_class_names(),
                 ))
             with gr.Column(scale=1):
                 ablation_label_path = Path(GRADIO_CHECKPOINTS[ablation_name]["label_vocab"])
-                gr.Markdown(f"### {ablation_name} : {len(read_label_tsv(ablation_label_path))} labels")
+                gr.Markdown(
+                    f"### {ablation_name} :   "
+                    f"<mark style=\"background:var(--button-primary-background-fill);"
+                    f"color:var(--button-primary-text-color);padding:0.4em 0.4em;"
+                    f"margin-left:0.3em;border-radius:999px;\">"
+                    f"{len(read_label_tsv(ablation_label_path))} labels</mark>"
+                )
                 gr.HTML(label_badges_html(ablation_label_path))
         with gr.Row():
             baseline_output_video = gr.Video(
@@ -1100,19 +1180,23 @@ def launch_gradio(args: argparse.Namespace) -> None:
             """,
         )
         render_both_button.click(
-            render_both_ui,
+            render_baseline_ui,
             inputs=input_video,
-            outputs=[baseline_output_video, ablation_output_video],
+            outputs=[baseline_output_video, last_used_html],
+        ).then(
+            render_ablation_ui,
+            inputs=input_video,
+            outputs=[ablation_output_video, last_used_html],
         )
         render_baseline_button.click(
             render_baseline_ui,
             inputs=input_video,
-            outputs=baseline_output_video,
+            outputs=[baseline_output_video, last_used_html],
         )
         render_ablation_button.click(
             render_ablation_ui,
             inputs=input_video,
-            outputs=ablation_output_video,
+            outputs=[ablation_output_video, last_used_html],
         )
     demo.queue(default_concurrency_limit=1).launch(
         server_name=args.server_name,
