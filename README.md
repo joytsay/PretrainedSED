@@ -220,7 +220,16 @@ python ex_dcase2016task2.py --task_path=/data/hear_datasets/tasks/audio_set_stro
 ```sh
 python render_sed_overlay_video.py --video videos/M16WithSilencerHasanM4upperForAllYouGamersLol_0YTieIiZNN4.mp4 --out output/M16WithSilencerHasanM4upperForAllYouGamersLol_0YTieIiZNN4_oxp.mp4 --ckpt PTSED/oxpir1dq/checkpoints/epoch\=299-step\=6300.ckpt --label-vocab /data/hear_datasets/tasks/audio_set_strong_street_boom_2m/labelvocabulary.csv  --n-classes 13
 ```
+
+* launch the Gradio video renderer (files in `videos/` are shown as examples)
+```sh
+python render_sed_overlay_video.py --gradio
 ```
+
+The interface can render the 447-class `resources/ATST-F_strong_1.pt` model
+(using `mid_to_display_name.tsv`), the 13-class `PTSED/e3jathho` model (using its
+local `labelvocabulary.csv`), or both. Each model has a separate result player.
+Rendered MP4 files are written to `output/`.
 
 
 ### Student Model Performances on AudioSet Strong (*from paper*)
