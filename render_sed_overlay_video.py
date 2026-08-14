@@ -11,6 +11,7 @@ import argparse
 import copy
 import csv
 import gc
+import html
 import json
 import math
 import os
@@ -787,6 +788,39 @@ def discover_example_videos(videos_dir: Path) -> list[Path]:
     )
 
 
+def label_badges_html(label_vocab_path: Path, ordered_labels: list[str] | None = None) -> str:
+    labels = ordered_labels or [name for _, name in read_label_tsv(label_vocab_path)]
+    badges = []
+    for index, label in enumerate(labels):
+        key = str(index + 1)
+        hue = (len(label) * 137.508) % 360
+        color = f"hsl({hue:.2f}, 70%, 52%)"
+        key_markup = (
+            f'<kbd style="border:0;background:transparent;color:var(--body-text-color-subdued);'
+            f'font:13px ui-monospace,monospace;">{html.escape(key)}</kbd>'
+            if key
+            else ""
+        )
+        badges.append(
+            f"""
+            <span style="display:inline-flex;align-items:center;gap:12px;
+                         padding:7px 10px;border-left:4px solid {color};
+                         border-radius:4px;background:var(--background-fill-secondary);
+                         color:var(--body-text-color);font-size:15px;line-height:1;">
+                <span>{html.escape(label)}</span>
+                {key_markup}
+            </span>
+            """
+        )
+    return (
+        "<div style=\"display:flex;flex-wrap:wrap;gap:8px;padding:12px;"
+        "height:84px;overflow-y:auto;margin-bottom:8px;border-radius:8px;"
+        "background:var(--background-fill-primary);\">"
+        + "".join(badges)
+        + "</div>"
+    )
+
+
 def launch_gradio(args: argparse.Namespace) -> None:
     try:
         import gradio as gr
@@ -909,6 +943,18 @@ def launch_gradio(args: argparse.Namespace) -> None:
             render_baseline_button = gr.Button(f"2. Render baseline {baseline_name}")
             render_ablation_button = gr.Button(f"3. Render ablation {ablation_name}")
         with gr.Row():
+            with gr.Column(scale=1):
+                baseline_label_path = Path(GRADIO_CHECKPOINTS[baseline_name]["label_vocab"])
+                gr.Markdown(f"### {baseline_name} : {len(read_label_tsv(baseline_label_path))} labels")
+                gr.HTML(label_badges_html(
+                    baseline_label_path,
+                    pretrained_sed_class_names(),
+                ))
+            with gr.Column(scale=1):
+                ablation_label_path = Path(GRADIO_CHECKPOINTS[ablation_name]["label_vocab"])
+                gr.Markdown(f"### {ablation_name} : {len(read_label_tsv(ablation_label_path))} labels")
+                gr.HTML(label_badges_html(ablation_label_path))
+        with gr.Row():
             baseline_output_video = gr.Video(
                 label=f"Baseline {baseline_name} result",
                 format="mp4",
@@ -957,10 +1003,11 @@ def launch_gradio(args: argparse.Namespace) -> None:
             """,
         )
         with gr.Row():
-            play_both_button = gr.Button("▶️ Play")
-            pause_both_button = gr.Button("⏸️ Pause")
+            play_pause_both_button = gr.Button("▶️ Play", elem_id="toggle-playback-button")
             restart_both_button = gr.Button("⏮️ Replay")
-        play_both_button.click(
+            backward_one_second_button = gr.Button("⏪ Backward 1 sec")
+            forward_one_second_button = gr.Button("Forward 1 sec ⏩")
+        play_pause_both_button.click(
             fn=None,
             queue=False,
             js="""
@@ -971,27 +1018,28 @@ def launch_gradio(args: argparse.Namespace) -> None:
                     alert('Render both videos before controlling playback.');
                     return [];
                 }
-                baseline.muted = true;
-                ablation.muted = false;
-                baseline.play();
-                ablation.play();
-                return [];
-            }
-            """,
-        )
-        pause_both_button.click(
-            fn=None,
-            queue=False,
-            js="""
-            () => {
-                const baseline = document.querySelector('#baseline-output-video video');
-                const ablation = document.querySelector('#ablation-output-video video');
-                if (!baseline || !ablation) {
-                    alert('Render both videos before controlling playback.');
-                    return [];
+                const container = document.querySelector('#toggle-playback-button');
+                const button = container?.matches('button')
+                    ? container
+                    : container?.querySelector('button');
+                const shouldPause = !baseline.paused || !ablation.paused;
+                if (shouldPause) {
+                    baseline.pause();
+                    ablation.pause();
+                    baseline.muted = false;
+                    if (button) button.textContent = '▶️ Play';
+                } else {
+                    baseline.muted = true;
+                    ablation.muted = false;
+                    const restoreBaselineAudio = () => {
+                        baseline.muted = false;
+                    };
+                    ablation.addEventListener('pause', restoreBaselineAudio, {once: true});
+                    ablation.addEventListener('ended', restoreBaselineAudio, {once: true});
+                    baseline.play();
+                    ablation.play();
+                    if (button) button.textContent = '⏸️ Pause';
                 }
-                baseline.pause();
-                ablation.pause();
                 return [];
             }
             """,
@@ -1009,6 +1057,44 @@ def launch_gradio(args: argparse.Namespace) -> None:
                 }
                 baseline.currentTime = 0;
                 ablation.currentTime = 0;
+                return [];
+            }
+            """,
+        )
+        backward_one_second_button.click(
+            fn=None,
+            queue=False,
+            js="""
+            () => {
+                const baseline = document.querySelector('#baseline-output-video video');
+                const ablation = document.querySelector('#ablation-output-video video');
+                if (!baseline || !ablation) {
+                    alert('Render both videos before controlling playback.');
+                    return [];
+                }
+                const targetTime = Math.max(0, baseline.currentTime - 1);
+                baseline.currentTime = targetTime;
+                ablation.currentTime = targetTime;
+                return [];
+            }
+            """,
+        )
+        forward_one_second_button.click(
+            fn=None,
+            queue=False,
+            js="""
+            () => {
+                const baseline = document.querySelector('#baseline-output-video video');
+                const ablation = document.querySelector('#ablation-output-video video');
+                if (!baseline || !ablation) {
+                    alert('Render both videos before controlling playback.');
+                    return [];
+                }
+                const durations = [baseline.duration, ablation.duration].filter(Number.isFinite);
+                const lastTime = durations.length ? Math.min(...durations) : Infinity;
+                const targetTime = Math.min(lastTime, baseline.currentTime + 1);
+                baseline.currentTime = targetTime;
+                ablation.currentTime = targetTime;
                 return [];
             }
             """,
