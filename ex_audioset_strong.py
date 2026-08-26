@@ -5,11 +5,13 @@ from torch.utils.data import DataLoader
 import argparse
 from pathlib import Path
 import torch.nn as nn
+import torch.nn.functional as F
 import wandb
 import transformers
 import math
 import random
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 import sed_scores_eval
 
@@ -120,6 +122,42 @@ class PLModule(pl.LightningModule):
         # prepare ingredients for knowledge distillation
         assert 0 <= config.distillation_loss_weight <= 1, "Lambda for Knowledge Distillation must be between 0 and 1."
         self.strong_loss = nn.BCEWithLogitsLoss()
+        confidence_classes = set(config.confidence_classes or [])
+        ambiguous_impact_classes = set(config.ambiguous_impact_classes or [])
+        unknown_confidence_classes = confidence_classes - set(encoder.labels)
+        unknown_ambiguous_classes = ambiguous_impact_classes - set(encoder.labels)
+        if unknown_confidence_classes or unknown_ambiguous_classes:
+            raise ValueError(
+                "Unknown confidence/ambiguous classes: "
+                f"{sorted(unknown_confidence_classes | unknown_ambiguous_classes)}"
+            )
+        positive_weights = torch.ones(n_classes_strong)
+        confidence_mask = torch.zeros(n_classes_strong, dtype=torch.bool)
+        ambiguous_mask = torch.zeros(n_classes_strong, dtype=torch.bool)
+        for index, label in enumerate(encoder.labels):
+            if label in confidence_classes:
+                positive_weights[index] = config.confidence_pos_weight
+                confidence_mask[index] = True
+            if label in ambiguous_impact_classes:
+                ambiguous_mask[index] = True
+        self.register_buffer(
+            "confidence_positive_weights",
+            positive_weights.view(1, -1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "confidence_class_mask",
+            confidence_mask.view(1, -1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "ambiguous_impact_class_mask",
+            ambiguous_mask.view(1, -1, 1),
+            persistent=False,
+        )
+        self.confidence_target_logit = math.log(
+            config.positive_confidence_target / (1.0 - config.positive_confidence_target)
+        )
 
         self.freq_warp = RandomResizeCrop((1, 1.0), time_scale=(1.0, 1.0))
 
@@ -150,6 +188,47 @@ class PLModule(pl.LightningModule):
         mel = self.model.mel_forward(x)
         y_strong, _ = self.model(mel)
         return y_strong
+
+    def confidence_supervised_loss(self, logits, targets):
+        element_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        weights = 1.0 + (self.confidence_positive_weights - 1.0) * targets
+        loss_mask = torch.ones_like(element_loss)
+        if self.ambiguous_impact_class_mask.any():
+            ambiguous_frames = (
+                (targets > 0.5) & self.ambiguous_impact_class_mask
+            ).any(dim=1, keepdim=True)
+            ignored_negatives = (
+                ambiguous_frames
+                & self.confidence_class_mask
+                & (targets <= 0.5)
+            )
+            loss_mask = loss_mask.masked_fill(ignored_negatives, 0.0)
+        supervised_loss = (element_loss * weights * loss_mask).sum() / loss_mask.sum().clamp_min(1.0)
+
+        positive_mask = (targets > 0.5) & self.confidence_class_mask
+        if positive_mask.any():
+            margin_losses = []
+            class_indices = torch.where(self.confidence_class_mask[0, :, 0])[0]
+            for batch_index in range(logits.shape[0]):
+                for class_index in class_indices:
+                    class_positive_logits = logits[batch_index, class_index][
+                        positive_mask[batch_index, class_index]
+                    ]
+                    if class_positive_logits.numel() == 0:
+                        continue
+                    keep = max(
+                        1,
+                        math.ceil(
+                            class_positive_logits.numel()
+                            * self.config.confidence_margin_top_fraction
+                        ),
+                    )
+                    top_logits = torch.topk(class_positive_logits, keep).values
+                    margin_losses.append(F.relu(self.confidence_target_logit - top_logits).mean())
+            confidence_loss = torch.stack(margin_losses).mean()
+        else:
+            confidence_loss = logits.new_zeros(())
+        return supervised_loss, confidence_loss
 
     def get_optimizer(
             self, lr, adamw=False, weight_decay=0.01, betas=(0.9, 0.999)
@@ -219,9 +298,21 @@ class PLModule(pl.LightningModule):
 
         num_training_steps = self.trainer.estimated_stepping_batches
 
-        scheduler = self.get_lr_scheduler(optimizer, num_training_steps,
-                                          schedule_mode=self.config.schedule_mode,
-                                          lr_end=self.config.lr_end)
+        warmup_steps = min(
+            self.config.warmup_steps,
+            max(1, num_training_steps // 10),
+        )
+        print(
+            f"LR schedule: training_steps={num_training_steps}, "
+            f"warmup_steps={warmup_steps}"
+        )
+        scheduler = self.get_lr_scheduler(
+            optimizer,
+            num_training_steps,
+            schedule_mode=self.config.schedule_mode,
+            num_warmup_steps=warmup_steps,
+            lr_end=self.config.lr_end,
+        )
         lr_scheduler_config = {
             "scheduler": scheduler,
             "interval": "step",
@@ -292,7 +383,10 @@ class PLModule(pl.LightningModule):
         # forward through network; use strong head
         y_hat_strong, _ = self.model(mel)
 
-        strong_supervised_loss = self.strong_loss(y_hat_strong, labels)
+        strong_supervised_loss, confidence_loss = self.confidence_supervised_loss(
+            y_hat_strong,
+            labels,
+        )
 
         if self.config.distillation_loss_weight > 0:
             strong_distillation_loss = self.strong_loss(y_hat_strong, pseudo_labels)
@@ -300,7 +394,8 @@ class PLModule(pl.LightningModule):
             strong_distillation_loss = torch.tensor(0., device=y_hat_strong.device, dtype=y_hat_strong.dtype)
 
         loss = self.config.distillation_loss_weight * strong_distillation_loss \
-               + (1 - self.config.distillation_loss_weight) * strong_supervised_loss
+               + (1 - self.config.distillation_loss_weight) * strong_supervised_loss \
+               + self.config.positive_confidence_loss_weight * confidence_loss
 
         # logging
         self.log('epoch', self.current_epoch)
@@ -309,6 +404,15 @@ class PLModule(pl.LightningModule):
         self.log("train/loss", loss.detach().cpu(), prog_bar=True)
         self.log("train/strong_supervised_loss", strong_supervised_loss.detach().cpu())
         self.log("train/strong_distillation_loss", strong_distillation_loss.detach().cpu())
+        self.log("train/positive_confidence_loss", confidence_loss.detach().cpu())
+        positive_mask = (labels > 0.5) & self.confidence_class_mask
+        if positive_mask.any():
+            positive_probabilities = torch.sigmoid(y_hat_strong.detach())[positive_mask]
+            self.log("train/target_positive_mean_confidence", positive_probabilities.mean())
+            self.log(
+                "train/target_positive_over_0_6",
+                (positive_probabilities >= 0.6).float().mean(),
+            )
 
         return loss
 
@@ -319,6 +423,23 @@ class PLModule(pl.LightningModule):
             y_hat_strong = self(x)
             loss = self.strong_loss(y_hat_strong, y_strong)
             self.val_loss.append(loss.detach().cpu())
+            positive_mask = (y_strong > 0.5) & self.confidence_class_mask
+            if positive_mask.any():
+                positive_probabilities = torch.sigmoid(y_hat_strong.detach())[positive_mask]
+                self.log(
+                    "val/target_positive_mean_confidence",
+                    positive_probabilities.mean(),
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=x.shape[0],
+                )
+                self.log(
+                    "val/target_positive_over_0_6",
+                    (positive_probabilities >= 0.6).float().mean(),
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=x.shape[0],
+                )
             return
 
         if isinstance(raw_batch, dict):
@@ -446,6 +567,7 @@ def train(config):
             wavmix_p=config.wavmix_p,
             random_crop=True,
             pseudo_labels_file=config.pseudo_labels_file,
+            positive_crop_p=config.positive_crop_p,
         )
         eval_set = get_street_validation_dataset(
             config.task_path,
@@ -497,11 +619,24 @@ def train(config):
 
     # create pytorch lightening module
     pl_module = PLModule(config, encoder)
+    if config.init_from_checkpoint:
+        print(f"Loading model weights from: {config.init_from_checkpoint}")
+        checkpoint = torch.load(
+            config.init_from_checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
+        pl_module.load_state_dict(checkpoint["state_dict"], strict=True)
 
     # create the pytorch lightening trainer by specifying the number of epochs to train, the logger,
     # on which kind of device(s) to train and possible callbacks
+    callbacks = []
+    if config.checkpoint_dir:
+        callbacks.append(ModelCheckpoint(dirpath=config.checkpoint_dir, save_last=True,
+                                         filename='stage-{epoch:03d}'))
     trainer = pl.Trainer(max_epochs=config.n_epochs,
                          logger=wandb_logger,
+                         callbacks=callbacks,
                          accelerator='auto',
                          devices=config.num_devices,
                          precision=config.precision,
@@ -510,7 +645,7 @@ def train(config):
                          )
 
     # start training and validation for the specified number of epochs
-    trainer.fit(pl_module, train_dl, eval_dl)
+    trainer.fit(pl_module, train_dl, eval_dl, ckpt_path=config.resume_from_checkpoint)
 
     wandb.finish()
 
@@ -615,8 +750,37 @@ if __name__ == '__main__':
                         help='Epoch length for --task_path datasets. Defaults to len(train_set).')
     parser.add_argument('--task_num_workers', type=int, default=2,
                         help='Maximum dataloader workers used with --task_path datasets.')
+    parser.add_argument('--positive_crop_p', type=float, default=0.0,
+                        help='Probability that a random task crop is forced to contain an event.')
+    parser.add_argument('--resume_from_checkpoint', type=str, default=None,
+                        help='Resume model, optimizer, and scheduler state from the previous stage.')
+    parser.add_argument('--init_from_checkpoint', type=str, default=None,
+                        help='Initialize model weights only and start a new optimizer/epoch schedule.')
+    parser.add_argument('--checkpoint_dir', type=str, default=None,
+                        help='Directory for the stage checkpoint (last.ckpt).')
+    parser.add_argument('--confidence_classes', nargs='*', default=None,
+                        help='Classes receiving positive weighting and confidence-margin training.')
+    parser.add_argument('--ambiguous_impact_classes', nargs='*', default=None,
+                        help='Impact labels whose frames do not count as negatives for confidence classes.')
+    parser.add_argument('--confidence_pos_weight', type=float, default=1.0)
+    parser.add_argument('--positive_confidence_target', type=float, default=0.7)
+    parser.add_argument('--positive_confidence_loss_weight', type=float, default=0.0)
+    parser.add_argument('--confidence_margin_top_fraction', type=float, default=1.0,
+                        help='Top fraction of positive frames receiving confidence-margin loss.')
 
     args = parser.parse_args()
+    if not 0 <= args.positive_crop_p <= 1:
+        parser.error('--positive_crop_p must be between 0 and 1')
+    if args.resume_from_checkpoint and args.init_from_checkpoint:
+        parser.error('use only one of --resume_from_checkpoint and --init_from_checkpoint')
+    if args.confidence_pos_weight < 1:
+        parser.error('--confidence_pos_weight must be >= 1')
+    if not 0 < args.positive_confidence_target < 1:
+        parser.error('--positive_confidence_target must be between 0 and 1')
+    if args.positive_confidence_loss_weight < 0:
+        parser.error('--positive_confidence_loss_weight must be >= 0')
+    if not 0 < args.confidence_margin_top_fraction <= 1:
+        parser.error('--confidence_margin_top_fraction must be > 0 and <= 1')
     if args.evaluate:
         evaluate(args)
     else:

@@ -80,7 +80,8 @@ class RandomCropDataset(Dataset):
                  sample_rate: int,
                  label_fps: int,
                  label_to_idx: Dict,
-                 nlabels: int):
+                 nlabels: int,
+                 positive_crop_p: float = 0.0):
         self.clip_len = 120
         self.target_len = 10
         self.pieces_per_clip = self.clip_len // self.target_len
@@ -89,6 +90,7 @@ class RandomCropDataset(Dataset):
         assert self.audio_dir.is_dir(), f"{audio_dir} is not a directory"
         self.sample_rate = sample_rate
         self.label_fps = label_fps
+        self.positive_crop_p = positive_crop_p
         # all files are 120 seconds long, randomly crop 10 seconds snippets
         self.labels = []
         self.timestamps = []
@@ -129,6 +131,14 @@ class RandomCropDataset(Dataset):
                 audio = np.pad(audio, (0, pad))
             return audio, labels.transpose(0, 1), filename, self.timestamps[idx]
         offset = torch.randint(max_offset, (1,)).item()
+        if self.positive_crop_p > 0 and torch.rand(1).item() < self.positive_crop_p:
+            positive_frames = torch.where(self.labels[idx].any(dim=1))[0]
+            if len(positive_frames) > 0:
+                positive_frame = positive_frames[torch.randint(len(positive_frames), (1,))].item()
+                low = max(0, positive_frame - labels_to_pick + 1)
+                high = min(positive_frame, max_offset - 1)
+                if high >= low:
+                    offset = torch.randint(low, high + 1, (1,)).item()
         labels = self.labels[idx][offset:offset + labels_to_pick]
         scale = self.sample_rate // self.label_fps
         audio = audio[offset * scale:offset * scale + labels_to_pick * scale]
@@ -150,6 +160,7 @@ def get_training_dataset(
         wavmix_p=0.0,
         random_crop=True,
         pseudo_labels_file=None,
+        positive_crop_p=0.0,
 ):
     task_path = Path(task_path)
 
@@ -160,7 +171,15 @@ def get_training_dataset(
     audio_dir = task_path.joinpath(str(sample_rate), "train")
     train_fold_data = json.load(train_fold.open())
     if random_crop:
-        dataset = RandomCropDataset(train_fold_data, audio_dir, sample_rate, label_fps, label_to_idx, nlabels)
+        dataset = RandomCropDataset(
+            train_fold_data,
+            audio_dir,
+            sample_rate,
+            label_fps,
+            label_to_idx,
+            nlabels,
+            positive_crop_p=positive_crop_p,
+        )
     else:
         dataset = FixCropDataset(train_fold_data, audio_dir, sample_rate, label_fps, label_to_idx, nlabels)
     if pseudo_labels_file is not None:

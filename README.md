@@ -226,10 +226,13 @@ python render_sed_overlay_video.py --video videos/M16WithSilencerHasanM4upperFor
 python render_sed_overlay_video.py --gradio
 ```
 
-The interface can render the 447-class `resources/ATST-F_strong_1.pt` model
-(using `mid_to_display_name.tsv`), the 13-class `PTSED/e3jathho` model (using its
-local `labelvocabulary.csv`), or both. Each model has a separate result player.
-Rendered MP4 files are written to `output/`.
+The interface can render all 447 classes from `resources/ATST-F_strong_1.pt`,
+or a three-class ablation view that sums related model outputs for Glass
+breaking, Gunshot, and Siren and caps each confidence at 100%. The aggregation
+is editable in the Gradio UI; applying it validates and saves the CSV to
+`class_mapping.csv` for future launches. Each view has a separate result
+player. Rendered MP4 files are written to `output/`. Rendering defaults to 10
+FPS for speed; use `--render-fps` to choose another maximum frame rate.
 
 
 ### Student Model Performances on AudioSet Strong (*from paper*)

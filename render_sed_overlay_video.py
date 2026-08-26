@@ -12,6 +12,7 @@ import copy
 import csv
 import gc
 import html
+import io
 import json
 import math
 import os
@@ -32,6 +33,7 @@ if str(REPO_ROOT) not in sys.path:
 
 _TAIPEI_TIMEZONE = ZoneInfo("Asia/Taipei")
 _LAST_USED_LOCK = threading.Lock()
+_MODEL_LOAD_LOCK = threading.Lock()
 _LAST_USED_STATE: dict[str, str | None] = {
     "ip": None,
     "action": None,
@@ -97,24 +99,29 @@ DEFAULT_CKPT = REPO_ROOT / "resources" / "ATST-F_strong_1.pt"
 DEFAULT_LABEL_TSV = REPO_ROOT / "mid_street_surveillance_10.tsv"
 DEFAULT_MID_TO_DISPLAY = REPO_ROOT / "mid_to_display_name.tsv"
 DEFAULT_COMMON_LABELS = REPO_ROOT / "common_labels.txt"
+CLASS_MAPPING_PATH = REPO_ROOT / "class_mapping.csv"
 
 # Gradio comparison labels. Change these two names to update the buttons,
 # result players, progress messages, and checkpoint lookup keys together.
 BASELINE = "ATST-F_strong_1"
-ABLATION = "e3jatho"
+ABLATION = "ATST-F_strong_1 (Class Aggregate)"
 GRADIO_MODELS = [BASELINE, ABLATION]
 
 GRADIO_CHECKPOINTS = {
     BASELINE: {
         "checkpoint": REPO_ROOT / "resources" / "ATST-F_strong_1.pt",
         "label_vocab": REPO_ROOT / "mid_to_display_name.tsv",
+        "label_tsv": None,
+        "class_mapping": None,
         "n_classes": 447,
         "top_k": 13,
     },
     ABLATION: {
-        "checkpoint": REPO_ROOT / "PTSED" / "e3jathho" / "checkpoints" / "epoch=299-step=5400.ckpt",
-        "label_vocab": REPO_ROOT / "PTSED" / "e3jathho" / "labelvocabulary.csv",
-        "n_classes": 13,
+        "checkpoint": REPO_ROOT / "resources" / "ATST-F_strong_1.pt",
+        "label_vocab": REPO_ROOT / "mid_to_display_name.tsv",
+        "label_tsv": None,
+        "class_mapping": CLASS_MAPPING_PATH,
+        "n_classes": 447,
         "top_k": 13,
     },
 }
@@ -154,6 +161,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment-name", type=str, default=None)
     parser.add_argument("--top-k", type=int, default=11)
     parser.add_argument(
+        "--render-fps",
+        type=float,
+        default=10.0,
+        help="Maximum output frame rate. Lower values render faster (default: 10).",
+    )
+    parser.add_argument(
         "--pos-x",
         choices=["left", "right"],
         default="right",
@@ -188,6 +201,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
 import numpy as np
+import pandas as pd
 import torch
 import torchaudio
 from PIL import Image, ImageDraw, ImageFont
@@ -246,7 +260,7 @@ class RenderSedModel(nn.Module):
         return torch.sigmoid(self.model(wav))
 
 
-def load_render_model(args: argparse.Namespace) -> nn.Module:
+def load_render_model(args: argparse.Namespace, class_names: list[str]) -> nn.Module:
     task_spec = get_task_spec(args.task)
     if args.task_path is None:
         args.task_path = task_spec["default_task_path"]
@@ -256,8 +270,30 @@ def load_render_model(args: argparse.Namespace) -> nn.Module:
     if args.experiment_name is None:
         args.experiment_name = task_spec["default_experiment_name"]
     cfg = build_config(args)
+
+    # The training LightningModules initialize evaluation metrics from the task
+    # vocabulary even though rendering only keeps their inference model.  Avoid
+    # requiring the training dataset to be mounted by supplying the vocabulary
+    # already resolved by this renderer when the task CSV is unavailable.
+    task_vocab_path = Path(args.task_path) / "labelvocabulary.csv"
     try:
-        model = load_model_from_checkpoint(task_spec["plmodule"], args.ckpt, cfg)
+        with _MODEL_LOAD_LOCK:
+            module_globals = task_spec["plmodule"].__init__.__globals__
+            original_vocab_loader = None
+            if not task_vocab_path.is_file():
+                original_vocab_loader = module_globals["label_vocab_nlabels"]
+                render_vocab = pd.DataFrame(
+                    {"label": class_names, "idx": range(len(class_names))}
+                )
+                module_globals["label_vocab_nlabels"] = lambda _task_path: (
+                    render_vocab.copy(),
+                    len(render_vocab),
+                )
+            try:
+                model = load_model_from_checkpoint(task_spec["plmodule"], args.ckpt, cfg)
+            finally:
+                if original_vocab_loader is not None:
+                    module_globals["label_vocab_nlabels"] = original_vocab_loader
     except RuntimeError as exc:
         if "failed finding central directory" in str(exc).lower():
             raise RuntimeError(
@@ -333,6 +369,7 @@ def selected_indices_for_tsv(
     label_rows: list[tuple[str, str]],
     model_class_names: list[str],
     num_labels: int,
+    label_id_to_model_name: dict[str, str] | None = None,
 ):
     model_class_names = model_class_names[:num_labels]
     name_to_index = {name.lower(): idx for idx, name in enumerate(model_class_names)}
@@ -349,6 +386,10 @@ def selected_indices_for_tsv(
             index = name_to_index.get(name.lower())
         if index is None:
             index = name_to_index.get(label_id.lower())
+        if index is None and label_id_to_model_name is not None:
+            model_name = label_id_to_model_name.get(label_id)
+            if model_name is not None:
+                index = name_to_index.get(model_name.lower())
         if index is None:
             raise ValueError(f"Requested label is not in the model output vocabulary: {label_id}, {name}")
         indices.append(index)
@@ -366,6 +407,80 @@ def read_mid_to_display_name(path: Path) -> dict[str, str]:
             if len(row) >= 2 and row[0].strip():
                 mid_to_name[row[0].strip()] = row[1].strip()
     return mid_to_name
+
+
+def parse_class_mapping(
+    mapping_text: str,
+    model_class_names: list[str],
+) -> tuple[list[str], list[list[int]], str]:
+    """Validate an editable TSV and resolve each aggregate to model indices."""
+    name_to_index = {
+        class_name.casefold(): index
+        for index, class_name in enumerate(model_class_names)
+    }
+    grouped_indices: dict[str, list[int]] = {}
+    normalized_rows: list[tuple[str, str]] = []
+
+    for line_number, row in enumerate(
+        csv.reader(io.StringIO(mapping_text)),
+        start=1,
+    ):
+        if not row or not any(field.strip() for field in row):
+            continue
+        if row[0].lstrip().startswith("#"):
+            continue
+        if (
+            row[0].strip().casefold() in {"class", "class_name", "output_class"}
+            and len(row) >= 2
+            and row[1].strip().casefold() in {"source", "source_class"}
+        ):
+            continue
+        if len(row) < 2:
+            raise ValueError(
+                f"Class mapping line {line_number} must contain an aggregate class "
+                "and source class separated by a comma."
+            )
+
+        output_name = row[0].strip()
+        source_class = row[1].strip()
+        if not output_name or not source_class:
+            raise ValueError(
+                f"Class mapping line {line_number} has an empty aggregate or source class."
+            )
+        source_index = name_to_index.get(source_class.casefold())
+        if source_index is None:
+            raise ValueError(
+                f"Class mapping line {line_number} source is not in the model vocabulary: "
+                f"{source_class}"
+            )
+
+        group = grouped_indices.setdefault(output_name, [])
+        if source_index in group:
+            raise ValueError(
+                f"Class mapping line {line_number} duplicates {source_class!r} in {output_name!r}."
+            )
+        group.append(source_index)
+        normalized_rows.append((output_name, model_class_names[source_index]))
+
+    if not grouped_indices:
+        raise ValueError("Class mapping must define at least one aggregate class.")
+
+    normalized_buffer = io.StringIO()
+    writer = csv.writer(normalized_buffer, lineterminator="\n")
+    writer.writerow(("class_name", "source_class"))
+    writer.writerows(normalized_rows)
+    normalized = normalized_buffer.getvalue()
+    return list(grouped_indices), list(grouped_indices.values()), normalized
+
+
+def load_class_mapping_text(path: Path = CLASS_MAPPING_PATH) -> str:
+    if not path.is_file():
+        raise FileNotFoundError(f"Class mapping does not exist: {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def save_class_mapping_text(mapping_text: str, path: Path = CLASS_MAPPING_PATH) -> None:
+    path.write_text(mapping_text, encoding="utf-8")
 
 
 def pretrained_sed_class_names() -> list[str]:
@@ -609,19 +724,19 @@ def compose_frame(
     return np.asarray(image)
 
 
-def open_video_reader(video_path: Path, width: int, height: int):
+def open_video_reader(video_path: Path, width: int, height: int, fps: float):
     cmd = [
         ffmpeg_bin(),
         "-loglevel",
         "error",
         "-i",
         str(video_path),
+        "-vf",
+        f"fps={fps}",
         "-f",
         "rawvideo",
         "-pix_fmt",
         "rgb24",
-        "-vsync",
-        "0",
         "-",
     ]
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -653,6 +768,8 @@ def open_video_writer(output_path: Path, width: int, height: int, fps: float, au
         "18",
         "-pix_fmt",
         "yuv420p",
+        "-movflags",
+        "+faststart",
         "-c:a",
         "aac",
         "-shortest",
@@ -670,21 +787,24 @@ def prepare_render(args: argparse.Namespace) -> tuple[nn.Module, list[int], list
         args.task_path = task_spec["default_task_path"]
     if args.label_vocab is not None:
         task_class_names = class_names_from_label_vocab(args.label_vocab)
+        label_id_to_model_name = dict(read_label_tsv(args.label_vocab))
         vocabulary_description = str(args.label_vocab)
     elif (Path(args.task_path) / "labelvocabulary.csv").exists():
         label_vocab, _ = task_spec["label_vocab_nlabels"](Path(args.task_path))
         label_vocab = label_vocab.sort_values("idx")
         task_class_names = list(label_vocab["label"].astype(str))
+        label_id_to_model_name = None
         vocabulary_description = str(Path(args.task_path) / "labelvocabulary.csv")
     elif is_pretrained_audioset_ckpt(args.ckpt):
         task_class_names = pretrained_sed_class_names()
+        label_id_to_model_name = None
         vocabulary_description = "the built-in AudioSet Strong vocabulary"
     else:
         raise FileNotFoundError(
             f"No label vocabulary found under {args.task_path}. Pass --label-vocab for this checkpoint."
         )
 
-    model = load_render_model(args)
+    model = load_render_model(args, task_class_names)
     if len(task_class_names) != model.num_labels:
         raise ValueError(
             f"Class count mismatch: vocabulary {vocabulary_description} has "
@@ -699,6 +819,7 @@ def prepare_render(args: argparse.Namespace) -> tuple[nn.Module, list[int], list
             label_rows,
             task_class_names,
             model.num_labels,
+            label_id_to_model_name,
         )
     return model, class_indices, class_names
 
@@ -711,6 +832,7 @@ def render_video(
     video_path: Path,
     output_path: Path,
     progress=None,
+    aggregation_groups: list[list[int]] | None = None,
 ) -> Path:
     """Run SED inference and render a browser-compatible overlay video."""
     video_path = Path(video_path).resolve()
@@ -729,10 +851,23 @@ def render_video(
         extract_audio(video_path, audio_path)
         wav = load_audio(audio_path)
         report(0.05, "Running sound-event detection")
-        predictions = run_inference(model, wav, args.device)[0, class_indices].numpy()
-        print("selected_labels=" + ", ".join(
-            f"{index}:{name}" for index, name in zip(class_indices, class_names)
-        ))
+        full_predictions = run_inference(model, wav, args.device)[0]
+        if aggregation_groups is None:
+            predictions = full_predictions[class_indices].numpy()
+            print("selected_labels=" + ", ".join(
+                f"{index}:{name}" for index, name in zip(class_indices, class_names)
+            ))
+        else:
+            predictions = torch.stack(
+                [
+                    full_predictions[source_indices].sum(dim=0).clamp(min=0.0, max=1.0)
+                    for source_indices in aggregation_groups
+                ]
+            ).numpy()
+            print("aggregated_labels=" + ", ".join(
+                f"{name}:{source_indices}"
+                for name, source_indices in zip(class_names, aggregation_groups)
+            ))
         print(
             f"score_stats=min={float(predictions.min()):.4f} "
             f"mean={float(predictions.mean()):.4f} max={float(predictions.max()):.4f}"
@@ -741,9 +876,11 @@ def render_video(
         meta = ffprobe_video(video_path)
         frame_width = meta["width"]
         frame_height = meta["height"]
-        fps = meta["fps"]
+        if args.render_fps <= 0:
+            raise ValueError("--render-fps must be greater than zero")
+        fps = min(meta["fps"], args.render_fps)
         duration = max(meta["duration"], wav.shape[-1] / TARGET_SAMPLE_RATE)
-        frame_count = meta["frame_count"]
+        frame_count = max(1, int(math.ceil(duration * fps)))
         score_frames = predictions.shape[1]
         panel_width = max(1, int(frame_width * 0.25))
         mel_height = max(1, int(panel_width * 60 / 260))
@@ -755,7 +892,7 @@ def render_video(
         font = load_font(font_size)
 
         report(0.12, "Preparing overlays")
-        reader = open_video_reader(video_path, frame_width, frame_height)
+        reader = open_video_reader(video_path, frame_width, frame_height, fps)
         writer = open_video_writer(output_path, frame_width, frame_height, fps, audio_path)
         reader_stderr = b""
         writer_stderr = b""
@@ -894,49 +1031,78 @@ def launch_gradio(args: argparse.Namespace) -> None:
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     baseline_name, ablation_name = GRADIO_MODELS
-    model_cache = {"name": None, "bundle": None}
+    model_cache = {"key": None, "bundle": None}
 
     def get_renderer(checkpoint_name: str):
         if checkpoint_name not in GRADIO_CHECKPOINTS:
             raise ValueError(f"Unknown checkpoint selection: {checkpoint_name}")
-        if model_cache["name"] == checkpoint_name:
+        preset = GRADIO_CHECKPOINTS[checkpoint_name]
+        checkpoint_path = Path(preset["checkpoint"])
+        label_vocab_path = Path(preset["label_vocab"])
+        label_tsv_path = preset.get("label_tsv")
+        if label_tsv_path is not None:
+            label_tsv_path = Path(label_tsv_path)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
+        if not label_vocab_path.is_file():
+            raise FileNotFoundError(f"Label vocabulary does not exist: {label_vocab_path}")
+        if label_tsv_path is not None and not label_tsv_path.is_file():
+            raise FileNotFoundError(f"Label filter does not exist: {label_tsv_path}")
+
+        cache_key = (
+            checkpoint_path.resolve(),
+            label_vocab_path.resolve(),
+            label_tsv_path.resolve() if label_tsv_path is not None else None,
+            int(preset["n_classes"]),
+        )
+        if model_cache["key"] == cache_key:
             return model_cache["bundle"]
 
         old_bundle = model_cache["bundle"]
         if old_bundle is not None:
             old_bundle[1].to("cpu")
-            model_cache["name"] = None
+            model_cache["key"] = None
             model_cache["bundle"] = None
             del old_bundle
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        preset = GRADIO_CHECKPOINTS[checkpoint_name]
-        checkpoint_path = Path(preset["checkpoint"])
-        label_vocab_path = Path(preset["label_vocab"])
-        if not checkpoint_path.is_file():
-            raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
-        if not label_vocab_path.is_file():
-            raise FileNotFoundError(f"Label vocabulary does not exist: {label_vocab_path}")
-
         render_args = copy.copy(args)
         render_args.ckpt = checkpoint_path
         render_args.label_vocab = label_vocab_path
+        render_args.label_tsv = label_tsv_path
         render_args.n_classes = int(preset["n_classes"])
         render_args.top_k = int(preset["top_k"])
         model, class_indices, class_names = prepare_render(render_args)
         bundle = (render_args, model, class_indices, class_names)
-        model_cache["name"] = checkpoint_name
+        model_cache["key"] = cache_key
         model_cache["bundle"] = bundle
         return bundle
 
-    def render_preset(video, checkpoint_name, progress):
+    def render_preset(video, checkpoint_name, progress, class_mapping_text=None):
         if not video:
             raise ValueError("Choose or upload a video first.")
         render_args, model, class_indices, class_names = get_renderer(checkpoint_name)
+        aggregation_groups = None
+        if GRADIO_CHECKPOINTS[checkpoint_name].get("class_mapping") is not None:
+            if class_mapping_text is None:
+                class_mapping_text = load_class_mapping_text()
+            class_names, aggregation_groups, _ = parse_class_mapping(
+                class_mapping_text,
+                pretrained_sed_class_names(),
+            )
         source = Path(video)
-        output = output_dir / f"{source.stem}__{render_args.ckpt.stem}__sed_overlay.mp4"
+        preset_slug = "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in checkpoint_name
+        ).strip("_")
+        # A unique URL prevents the browser from reusing a cached response when
+        # the same source/preset is rendered again.
+        render_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        output = output_dir / (
+            f"{source.stem}__{preset_slug}__{render_id}__sed_overlay.mp4"
+        )
         return str(
             render_video(
                 render_args,
@@ -946,6 +1112,7 @@ def launch_gradio(args: argparse.Namespace) -> None:
                 source,
                 output,
                 progress,
+                aggregation_groups,
             )
         )
 
@@ -963,7 +1130,12 @@ def launch_gradio(args: argparse.Namespace) -> None:
         except Exception as exc:
             raise gr.Error(str(exc)) from exc
 
-    def render_ablation_ui(video, request: gr.Request, progress=gr.Progress()):
+    def render_ablation_ui(
+        video,
+        class_mapping_text,
+        request: gr.Request,
+        progress=gr.Progress(),
+    ):
         try:
             result = _run_recorded_action(
                 f"ablation {ablation_name}",
@@ -972,8 +1144,58 @@ def launch_gradio(args: argparse.Namespace) -> None:
                 video,
                 ablation_name,
                 progress,
+                class_mapping_text,
             )
             return result, _last_used_html()
+        except Exception as exc:
+            raise gr.Error(str(exc)) from exc
+
+    initial_mapping_text = load_class_mapping_text()
+    initial_mapping_names, _, initial_mapping_text = parse_class_mapping(
+        initial_mapping_text,
+        pretrained_sed_class_names(),
+    )
+
+    def mapping_heading(names: list[str]) -> str:
+        return (
+            f"### {ablation_name} :   "
+            f"<mark style=\"background:var(--button-primary-background-fill);"
+            f"color:var(--button-primary-text-color);padding:0.4em 0.4em;"
+            f"margin-left:0.3em;border-radius:999px;\">"
+            f"{len(names)} aggregate labels</mark>"
+        )
+
+    def apply_class_mapping_ui(mapping_text):
+        try:
+            names, _, normalized = parse_class_mapping(
+                mapping_text,
+                pretrained_sed_class_names(),
+            )
+            save_class_mapping_text(normalized)
+            return (
+                normalized,
+                normalized,
+                f"Saved {len(names)} aggregate classes to `{CLASS_MAPPING_PATH}`.",
+                mapping_heading(names),
+                label_badges_html(DEFAULT_MID_TO_DISPLAY, names),
+            )
+        except Exception as exc:
+            raise gr.Error(str(exc)) from exc
+
+    def reload_class_mapping_ui():
+        try:
+            mapping_text = load_class_mapping_text()
+            names, _, normalized = parse_class_mapping(
+                mapping_text,
+                pretrained_sed_class_names(),
+            )
+            return (
+                normalized,
+                normalized,
+                f"Loaded {len(names)} aggregate classes from `{CLASS_MAPPING_PATH}`.",
+                mapping_heading(names),
+                label_badges_html(DEFAULT_MID_TO_DISPLAY, names),
+            )
         except Exception as exc:
             raise gr.Error(str(exc)) from exc
 
@@ -1009,10 +1231,35 @@ def launch_gradio(args: argparse.Namespace) -> None:
                     )
                 else:
                     gr.Markdown(f"No example videos found in `{args.videos_dir.resolve()}`.")
+        with gr.Accordion("Ablation class mapping", open=True):
+            gr.Markdown(
+                "Each row maps one model source class into an aggregate output class. "
+                "Edit the CSV, then apply it before rendering the ablation. "
+                "Source confidences are summed and capped at 100%."
+            )
+            class_mapping_textbox = gr.Textbox(
+                value=initial_mapping_text,
+                label="class_mapping.csv",
+                lines=11,
+                max_lines=24,
+            )
+            class_mapping_state = gr.State(initial_mapping_text)
+            with gr.Row():
+                apply_mapping_button = gr.Button("Apply and save mapping", variant="primary")
+                reload_mapping_button = gr.Button("Reload saved mapping")
+            class_mapping_status = gr.Markdown(
+                f"Loaded `{CLASS_MAPPING_PATH}`."
+            )
         with gr.Row():
-            render_both_button = gr.Button("1. Render both", variant="primary")
-            render_baseline_button = gr.Button(f"2. Render baseline {baseline_name}")
-            render_ablation_button = gr.Button(f"3. Render ablation {ablation_name}")
+            render_both_button = gr.Button("Render both", variant="primary", visible=True)
+            render_baseline_button = gr.Button(
+                f"Render baseline {baseline_name}",
+                elem_id="render-baseline-button",
+            )
+            render_ablation_button = gr.Button(
+                f"Render ablation {ablation_name}",
+                elem_id="render-ablation-button",
+            )
         with gr.Row():
             with gr.Column(scale=1):
                 baseline_label_path = Path(GRADIO_CHECKPOINTS[baseline_name]["label_vocab"])
@@ -1028,15 +1275,28 @@ def launch_gradio(args: argparse.Namespace) -> None:
                     pretrained_sed_class_names(),
                 ))
             with gr.Column(scale=1):
-                ablation_label_path = Path(GRADIO_CHECKPOINTS[ablation_name]["label_vocab"])
-                gr.Markdown(
-                    f"### {ablation_name} :   "
-                    f"<mark style=\"background:var(--button-primary-background-fill);"
-                    f"color:var(--button-primary-text-color);padding:0.4em 0.4em;"
-                    f"margin-left:0.3em;border-radius:999px;\">"
-                    f"{len(read_label_tsv(ablation_label_path))} labels</mark>"
+                ablation_mapping_heading = gr.Markdown(
+                    mapping_heading(initial_mapping_names)
                 )
-                gr.HTML(label_badges_html(ablation_label_path))
+                ablation_mapping_badges = gr.HTML(
+                    label_badges_html(DEFAULT_MID_TO_DISPLAY, initial_mapping_names)
+                )
+        mapping_outputs = [
+            class_mapping_textbox,
+            class_mapping_state,
+            class_mapping_status,
+            ablation_mapping_heading,
+            ablation_mapping_badges,
+        ]
+        apply_mapping_button.click(
+            apply_class_mapping_ui,
+            inputs=class_mapping_textbox,
+            outputs=mapping_outputs,
+        )
+        reload_mapping_button.click(
+            reload_class_mapping_ui,
+            outputs=mapping_outputs,
+        )
         with gr.Row():
             baseline_output_video = gr.Video(
                 label=f"Baseline {baseline_name} result",
@@ -1183,23 +1443,40 @@ def launch_gradio(args: argparse.Namespace) -> None:
             """,
         )
         render_both_button.click(
-            render_baseline_ui,
-            inputs=input_video,
-            outputs=[baseline_output_video, last_used_html],
-        ).then(
-            render_ablation_ui,
-            inputs=input_video,
-            outputs=[ablation_output_video, last_used_html],
+            fn=None,
+            queue=False,
+            js="""
+            () => {
+                const findButton = (selector) => {
+                    const container = document.querySelector(selector);
+                    return container?.matches('button')
+                        ? container
+                        : container?.querySelector('button');
+                };
+                const baselineButton = findButton('#render-baseline-button');
+                const ablationButton = findButton('#render-ablation-button');
+                if (!baselineButton || !ablationButton) {
+                    throw new Error('Could not find both render buttons.');
+                }
+                baselineButton.click();
+                ablationButton.click();
+                return [];
+            }
+            """,
         )
         render_baseline_button.click(
             render_baseline_ui,
             inputs=input_video,
             outputs=[baseline_output_video, last_used_html],
+            concurrency_id="sed-video-render",
+            concurrency_limit=1,
         )
         render_ablation_button.click(
             render_ablation_ui,
-            inputs=input_video,
+            inputs=[input_video, class_mapping_state],
             outputs=[ablation_output_video, last_used_html],
+            concurrency_id="sed-video-render",
+            concurrency_limit=1,
         )
     demo.queue(default_concurrency_limit=1).launch(
         server_name=args.server_name,

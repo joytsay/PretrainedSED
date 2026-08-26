@@ -197,3 +197,11 @@ cache/
 
 # vscode
 .vscode/
+/eval_dcase2016task2_base
+/eval_dcase2016task2_ckpt
+/videos
+/resources
+/eval_test
+/PTSED
+/output
+/eval_aug*

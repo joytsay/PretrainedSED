@@ -726,6 +726,20 @@ def synthesize_balanced_clip(
     gunshot_min_gap_s: float,
     gunshot_max_gap_s: float,
     background_bed_db: float,
+    extra_class: Optional[str] = None,
+    extra_events: int = 0,
+    active_class: Optional[str] = None,
+    focus_classes: Optional[set[str]] = None,
+    confuser_classes: Optional[set[str]] = None,
+    focus_event_range: Tuple[int, int] = (6, 10),
+    confuser_event_range: Tuple[int, int] = (3, 6),
+    context_event_range: Tuple[int, int] = (0, 2),
+    event_gain_db_range: Tuple[float, float] = (-6.0, 0.0),
+    event_speed_range: Tuple[float, float] = (0.92, 1.08),
+    gunshot_unique_sources: bool = False,
+    gunshot_burst_probability: float = 1.0,
+    background_bed_db_range: Optional[Tuple[float, float]] = None,
+    co_label_focus_events: bool = False,
 ) -> Tuple[np.ndarray, List[dict]]:
     """Create one WAV with exactly the same event count for every class."""
     total_samples = int(round(clip_len_s * sample_rate))
@@ -737,19 +751,39 @@ def synthesize_balanced_clip(
             sample_rate,
             clip_len_s,
         )
-        output += background * (10 ** (background_bed_db / 20.0))
+        bed_db = background_bed_db
+        if background_bed_db_range is not None:
+            bed_db = rng.uniform(*background_bed_db_range)
+        output += background * (10 ** (bed_db / 20.0))
 
     # Rare classes can legitimately have no source in validation after a
     # source-disjoint split. Keep them in the vocabulary, but do not fabricate
     # validation audio for an empty split-specific pool.
     labels = [label for label, clips in clips_by_label.items() if clips]
+    if active_class is not None:
+        labels = [label for label in labels if label == active_class]
     rng.shuffle(labels)
     if "Gunshot, gunfire" in labels:
         labels.remove("Gunshot, gunfire")
         labels.insert(0, "Gunshot, gunfire")
     events: List[dict] = []
     for label in labels:
-        selection_count = 1 if label == "Gunshot, gunfire" else events_per_class
+        if focus_classes:
+            if label in focus_classes:
+                event_count = rng.randint(*focus_event_range)
+            elif label in (confuser_classes or set()):
+                event_count = rng.randint(*confuser_event_range)
+            else:
+                event_count = rng.randint(*context_event_range)
+        else:
+            event_count = events_per_class
+            if label == extra_class:
+                event_count += extra_events
+        if event_count <= 0:
+            continue
+        selection_count = event_count
+        if label == "Gunshot, gunfire" and not gunshot_unique_sources:
+            selection_count = 1
         selected = draw_balanced_class_clips(
             label,
             selection_count,
@@ -760,12 +794,17 @@ def synthesize_balanced_clip(
         )
         # A gunshot burst deliberately repeats one shot inside this WAV. The
         # selected base changes between WAVs whenever alternatives exist.
-        if label == "Gunshot, gunfire":
-            selected = [selected[0]] * events_per_class
+        if label == "Gunshot, gunfire" and not gunshot_unique_sources:
+            selected = [selected[0]] * event_count
 
         burst_cursor_s: Optional[float] = None
         for event_clip in selected:
-            event_audio, speed = vary_event_audio(event_clip.audio, rng)
+            event_audio, speed = vary_event_audio(
+                event_clip.audio,
+                rng,
+                min_speed=event_speed_range[0],
+                max_speed=event_speed_range[1],
+            )
             duration_s = len(event_audio) / sample_rate
             if duration_s > clip_len_s:
                 raise RuntimeError(
@@ -773,6 +812,12 @@ def synthesize_balanced_clip(
                     f"the requested {clip_len_s:.2f}s WAV."
                 )
 
+            if (
+                label == "Gunshot, gunfire"
+                and burst_cursor_s is not None
+                and rng.random() >= gunshot_burst_probability
+            ):
+                burst_cursor_s = None
             if label == "Gunshot, gunfire" and burst_cursor_s is not None:
                 start_s = burst_cursor_s + rng.uniform(
                     gunshot_min_gap_s,
@@ -815,7 +860,7 @@ def synthesize_balanced_clip(
 
             start = int(round(start_s * sample_rate))
             end = start + len(event_audio)
-            gain_db = rng.uniform(-6.0, 0.0)
+            gain_db = rng.uniform(*event_gain_db_range)
             output[start:end] += event_audio * (10 ** (gain_db / 20.0))
             start_ms = round(start / sample_rate * 1000.0, 3)
             end_ms = round(end / sample_rate * 1000.0, 3)
@@ -841,6 +886,21 @@ def synthesize_balanced_clip(
     max_abs = float(np.max(np.abs(output))) if output.size else 0.0
     if max_abs > 0.99:
         output = output / max_abs * 0.99
+    if co_label_focus_events and focus_classes:
+        expanded_events: List[dict] = []
+        positive_source_labels = focus_classes | (confuser_classes or set())
+        for event in events:
+            if event["label"] not in positive_source_labels:
+                expanded_events.append(event)
+                continue
+            for target_label in sorted(focus_classes):
+                co_labeled = dict(event)
+                co_labeled["source_label"] = event["label"]
+                co_labeled["label"] = target_label
+                expanded_events.append(co_labeled)
+            if event["label"] in (confuser_classes or set()):
+                expanded_events.append(event)
+        events = expanded_events
     return output, sorted(events, key=lambda event: event["start"])
 
 
@@ -1226,6 +1286,24 @@ def generate_split(
                 gunshot_min_gap_s=args.gunshot_min_gap,
                 gunshot_max_gap_s=args.gunshot_max_gap,
                 background_bed_db=args.background_bed_db,
+                extra_class=args.extra_class,
+                extra_events=args.extra_events,
+                active_class=args.active_class,
+                focus_classes=set(args.focus_classes or []),
+                confuser_classes=set(args.confuser_classes or []),
+                focus_event_range=(args.focus_min_events, args.focus_max_events),
+                confuser_event_range=(args.confuser_min_events, args.confuser_max_events),
+                context_event_range=(args.context_min_events, args.context_max_events),
+                event_gain_db_range=(args.event_gain_db_min, args.event_gain_db_max),
+                event_speed_range=(args.event_speed_min, args.event_speed_max),
+                gunshot_unique_sources=args.gunshot_unique_sources,
+                gunshot_burst_probability=args.gunshot_burst_probability,
+                background_bed_db_range=(
+                    (args.background_bed_db_min, args.background_bed_db_max)
+                    if args.background_bed_db_min is not None
+                    else None
+                ),
+                co_label_focus_events=args.co_label_focus_events,
             )
         elif args.equal_class_show_time:
             empty_labels = [label for label, queue in clip_queues.items() if not queue]
@@ -1410,6 +1488,57 @@ def parse_args() -> argparse.Namespace:
         help="Additional pure-background negative clips per split, relative to the positive clip count.",
     )
     parser.add_argument(
+        "--extra_class",
+        type=str,
+        default=None,
+        help="Add extra balanced events for this class in every generated positive clip.",
+    )
+    parser.add_argument(
+        "--extra_events",
+        type=int,
+        default=0,
+        help="Number of extra events for --extra_class (used by staged training).",
+    )
+    parser.add_argument(
+        "--active_class",
+        type=str,
+        default=None,
+        help="Generate positive WAVs containing only this class; vocabulary remains unchanged.",
+    )
+    parser.add_argument(
+        "--focus_classes",
+        nargs="*",
+        default=None,
+        help="Classes jointly oversampled in every positive WAV.",
+    )
+    parser.add_argument("--confuser_classes", nargs="*", default=None)
+    parser.add_argument("--focus_min_events", type=int, default=6)
+    parser.add_argument("--focus_max_events", type=int, default=10)
+    parser.add_argument("--confuser_min_events", type=int, default=3)
+    parser.add_argument("--confuser_max_events", type=int, default=6)
+    parser.add_argument("--context_min_events", type=int, default=0)
+    parser.add_argument("--context_max_events", type=int, default=2)
+    parser.add_argument("--event_gain_db_min", type=float, default=-6.0)
+    parser.add_argument("--event_gain_db_max", type=float, default=0.0)
+    parser.add_argument("--event_speed_min", type=float, default=0.92)
+    parser.add_argument("--event_speed_max", type=float, default=1.08)
+    parser.add_argument(
+        "--gunshot_unique_sources",
+        action="store_true",
+        help="Use different source intervals within a gunshot sequence when possible.",
+    )
+    parser.add_argument("--gunshot_burst_probability", type=float, default=1.0)
+    parser.add_argument("--background_bed_db_min", type=float, default=None)
+    parser.add_argument("--background_bed_db_max", type=float, default=None)
+    parser.add_argument(
+        "--co_label_focus_events",
+        action="store_true",
+        help=(
+            "Label every focus/confuser event as all focus classes. Use when "
+            "simultaneous focus-class activation is preferred over discrimination."
+        ),
+    )
+    parser.add_argument(
         "--max_background_source_clips",
         type=int,
         default=500,
@@ -1431,6 +1560,15 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
         help="Fraction of AudioSet train source recordings reserved exclusively for validation.",
     )
+    parser.add_argument(
+        "--pool_source_splits",
+        action="store_true",
+        help=(
+            "Pool AudioSet train/test sources, then create new source-disjoint "
+            "train/valid/test partitions. Useful when rare classes have very few train sources."
+        ),
+    )
+    parser.add_argument("--test_source_fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument(
         "--eval",
@@ -1487,6 +1625,41 @@ def main() -> None:
         raise ValueError("--overlap must be between 0 and 1")
     if args.events_per_class < 0:
         raise ValueError("--events_per_class must be >= 0")
+    if args.extra_events < 0:
+        raise ValueError("--extra_events must be >= 0")
+    if args.extra_events and not args.extra_class:
+        raise ValueError("--extra_class is required when --extra_events is non-zero")
+    known_classes = {
+        line.split("\t", 1)[1].strip()
+        for line in args.class_file.read_text(encoding="utf-8").splitlines()
+        if "\t" in line and line.strip()
+    }
+    if args.active_class and args.active_class not in known_classes:
+        raise ValueError(f"--active_class is not present in {args.class_file}: {args.active_class!r}")
+    unknown_focus = set(args.focus_classes or []) - known_classes
+    unknown_confusers = set(args.confuser_classes or []) - known_classes
+    if unknown_focus or unknown_confusers:
+        raise ValueError(
+            f"Unknown focus/confuser classes: {sorted(unknown_focus | unknown_confusers)}"
+        )
+    for name in ("focus", "confuser", "context"):
+        minimum = getattr(args, f"{name}_min_events")
+        maximum = getattr(args, f"{name}_max_events")
+        if minimum < 0 or maximum < minimum:
+            raise ValueError(f"--{name}_min_events must be >= 0 and <= --{name}_max_events")
+    if args.event_gain_db_max < args.event_gain_db_min:
+        raise ValueError("--event_gain_db_max must be >= --event_gain_db_min")
+    if args.event_speed_min <= 0 or args.event_speed_max < args.event_speed_min:
+        raise ValueError("event speed range must be positive and ordered")
+    if not 0 <= args.gunshot_burst_probability <= 1:
+        raise ValueError("--gunshot_burst_probability must be between 0 and 1")
+    if (args.background_bed_db_min is None) != (args.background_bed_db_max is None):
+        raise ValueError("set both --background_bed_db_min and --background_bed_db_max")
+    if args.background_bed_db_min is not None:
+        if args.background_bed_db_max < args.background_bed_db_min:
+            raise ValueError("background bed dB range must be ordered")
+        if args.background_bed_db_max > 0:
+            raise ValueError("background bed dB values must be <= 0")
     if args.gunshot_min_gap < 0 or args.gunshot_max_gap < args.gunshot_min_gap:
         raise ValueError(
             "--gunshot_min_gap must be >= 0 and --gunshot_max_gap must be >= it"
@@ -1497,6 +1670,8 @@ def main() -> None:
         raise ValueError("--background_bed_db must be <= 0")
     if not 0 < args.valid_source_fraction < 1:
         raise ValueError("--valid_source_fraction must be between 0 and 1")
+    if not 0 < args.test_source_fraction < 1:
+        raise ValueError("--test_source_fraction must be between 0 and 1")
     if args.class_show_time is not None and args.class_show_time <= 0:
         raise ValueError("--class_show_time must be > 0")
     if args.equal_class_gap < 0:
@@ -1567,19 +1742,70 @@ def main() -> None:
         return
 
     split_rng = random.Random(args.seed + 1)
-    train_source, valid_source = split_event_clips_by_source(
-        train_source,
-        args.valid_source_fraction,
-        split_rng,
-    )
-    if train_background:
-        train_background, valid_background = split_background_clips_by_source(
-            train_background,
+    test_source = None
+    test_background = None
+    if args.pool_source_splits:
+        print(f"Pooling event sources from AudioSet test split: {args.source_path}")
+        supplemental_source = collect_event_clips(
+            args.source_path,
+            "test",
+            mid_to_label,
+            args.sample_rate,
+            args.max_source_clips_per_class,
+            args.min_event_s,
+            args.max_event_s,
+            no_crop_labels,
+            mid_to_display_name=mid_to_display_name,
+        )
+        pooled_source = {
+            label: train_source.get(label, []) + supplemental_source.get(label, [])
+            for label in label_to_idx
+        }
+        development_source, test_source = split_event_clips_by_source(
+            pooled_source,
+            args.test_source_fraction,
+            split_rng,
+        )
+        train_source, valid_source = split_event_clips_by_source(
+            development_source,
             args.valid_source_fraction,
             split_rng,
         )
+        supplemental_background = collect_background_clips(
+            args.source_path,
+            "test",
+            mid_to_label,
+            args.sample_rate,
+            args.max_background_source_clips if args.background_ratio > 0 else 0,
+        )
+        pooled_background = train_background + supplemental_background
+        if pooled_background:
+            development_background, test_background = split_background_clips_by_source(
+                pooled_background,
+                args.test_source_fraction,
+                split_rng,
+            )
+            train_background, valid_background = split_background_clips_by_source(
+                development_background,
+                args.valid_source_fraction,
+                split_rng,
+            )
+        else:
+            train_background, valid_background, test_background = [], [], []
     else:
-        valid_background = []
+        train_source, valid_source = split_event_clips_by_source(
+            train_source,
+            args.valid_source_fraction,
+            split_rng,
+        )
+        if train_background:
+            train_background, valid_background = split_background_clips_by_source(
+                train_background,
+                args.valid_source_fraction,
+                split_rng,
+            )
+        else:
+            valid_background = []
     print(
         "Source-disjoint train clips:",
         {label: len(clips) for label, clips in train_source.items()},
@@ -1589,26 +1815,27 @@ def main() -> None:
         {label: len(clips) for label, clips in valid_source.items()},
     )
 
-    print(f"Collecting test source events from AudioSet test split: {args.source_path}")
-    test_source = collect_event_clips(
-        args.source_path,
-        "test",
-        mid_to_label,
-        args.sample_rate,
-        args.max_source_clips_per_class,
-        args.min_event_s,
-        args.max_event_s,
-        no_crop_labels,
-        mid_to_display_name=mid_to_display_name,
-    )
+    if test_source is None:
+        print(f"Collecting test source events from AudioSet test split: {args.source_path}")
+        test_source = collect_event_clips(
+            args.source_path,
+            "test",
+            mid_to_label,
+            args.sample_rate,
+            args.max_source_clips_per_class,
+            args.min_event_s,
+            args.max_event_s,
+            no_crop_labels,
+            mid_to_display_name=mid_to_display_name,
+        )
+        test_background = collect_background_clips(
+            args.source_path,
+            "test",
+            mid_to_label,
+            args.sample_rate,
+            args.max_background_source_clips if args.background_ratio > 0 else 0,
+        )
     print({label: len(clips) for label, clips in test_source.items()})
-    test_background = collect_background_clips(
-        args.source_path,
-        "test",
-        mid_to_label,
-        args.sample_rate,
-        args.max_background_source_clips if args.background_ratio > 0 else 0,
-    )
     if test_background:
         print(f"Collected {len(test_background)} test background clips")
 
