@@ -234,6 +234,11 @@ is editable in the Gradio UI; applying it validates and saves the CSV to
 player. Rendered MP4 files are written to `output/`. Rendering defaults to 10
 FPS for speed; use `--render-fps` to choose another maximum frame rate.
 
+## C++ TensorRT aggregate SED testbed (Jetson AGX Orin)
+
+See [src/INSTALL.md](src/INSTALL.md) for TensorRT conversion, C++ build,
+frontend launch, and worker callback protocol instructions.
+
 
 ### Student Model Performances on AudioSet Strong (*from paper*)
 

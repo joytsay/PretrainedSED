@@ -16,6 +16,14 @@ RUN apt-get update \
       build-essential \
       cmake \
       ninja-build \
+      nlohmann-json3-dev \
+      qt6-base-dev \
+      qt6-multimedia-dev \
+      libxcb-cursor0 \
+      gstreamer1.0-plugins-base \
+      gstreamer1.0-plugins-good \
+      gstreamer1.0-plugins-bad \
+      gstreamer1.0-plugins-ugly \
       libsox-dev \
       libsox-fmt-all \
       ca-certificates \
