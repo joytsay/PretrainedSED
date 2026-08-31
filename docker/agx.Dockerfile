@@ -4,29 +4,42 @@ FROM nvcr.io/nvidia/pytorch:25.06-py3-igpu
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    QT_X11_NO_MITSHM=1 \
+    QT_MEDIA_BACKEND=ffmpeg \
+    GST_PLUGIN_FEATURE_RANK=nvv4l2decoder:0 \
+    XDG_RUNTIME_DIR=/tmp/runtime-root \
+    PULSE_SERVER=unix:/run/user/1000/pulse/native \
+    PULSE_COOKIE=/root/.config/pulse/cookie
 
-RUN apt-get update \
+RUN touch /etc/modules \
+ && apt-get update \
  && apt-get install -y --no-install-recommends \
       ffmpeg \
       libsndfile1 \
       libsndfile1-dev \
       libglib2.0-0 \
+      libasound2-plugins \
       git \
       build-essential \
       cmake \
       ninja-build \
+      kmod \
       nlohmann-json3-dev \
       qt6-base-dev \
       qt6-multimedia-dev \
       libxcb-cursor0 \
+      gstreamer1.0-tools \
+      gstreamer1.0-libav \
       gstreamer1.0-plugins-base \
       gstreamer1.0-plugins-good \
       gstreamer1.0-plugins-bad \
       gstreamer1.0-plugins-ugly \
+      pulseaudio-utils \
       libsox-dev \
       libsox-fmt-all \
       ca-certificates \
+ && install -d -m 0700 /tmp/runtime-root \
  && rm -rf /var/lib/apt/lists/*
 
 # The Jetson image provides Torch 2.8, but does not ship a compatible

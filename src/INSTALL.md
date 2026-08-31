@@ -19,6 +19,14 @@ the result at 100%.
 
 ## Convert the model
 
+Build on AGX with:
+
+docker build --no-cache --pull \
+  --platform linux/arm64 \
+  -f docker/agx.Dockerfile \
+  -t psed:latest \
+  .
+
 On the AGX container, convert the public checkpoint to ONNX and TensorRT FP16:
 
 ```sh
