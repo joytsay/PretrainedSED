@@ -19,6 +19,7 @@ target_link_libraries(atst_sed_testbed PRIVATE
 option(BUILD_TENSORRT_WORKER "Build the TensorRT callback worker" ON)
 if(BUILD_TENSORRT_WORKER)
     find_package(CUDAToolkit REQUIRED)
+    find_package(Threads REQUIRED)
     find_package(nlohmann_json 3.10 REQUIRED)
     find_path(TENSORRT_INCLUDE_DIR NvInfer.h
         HINTS /usr/include/aarch64-linux-gnu /usr/include /usr/local/TensorRT/include)
@@ -35,6 +36,7 @@ if(BUILD_TENSORRT_WORKER)
     target_link_libraries(atst_sed_worker PRIVATE
         ${TENSORRT_LIBRARY}
         CUDA::cudart
+        Threads::Threads
         nlohmann_json::nlohmann_json
     )
 endif()

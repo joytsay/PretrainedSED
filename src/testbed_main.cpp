@@ -12,6 +12,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QLineEdit>
 #include <QListWidget>
 #include <QMainWindow>
 #include <QMediaPlayer>
@@ -27,8 +28,16 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <csignal>
+#include <sys/types.h>
+#include <utility>
 
 namespace {
+
+constexpr int kSampleRate = 16000;
+constexpr int kPacketMilliseconds = 40;
+constexpr int kPacketSamples = kSampleRate * kPacketMilliseconds / 1000;
+constexpr int kPacketBytes = kPacketSamples * 2;
 
 struct ConfidenceFrame {
     qint64 timeMs = 0;
@@ -41,7 +50,9 @@ public:
         QString workerPath,
         QString enginePath,
         QString mappingPath,
-        QString labelsPath
+        QString labelsPath,
+        QString ffmpegPath,
+        QString initialCamId
     ) {
         setWindowTitle("ATST-F Aggregate SED Testbed");
         resize(1180, 760);
@@ -91,6 +102,13 @@ public:
         confidenceLayout->addWidget(threshold_, 3, 1);
         right->addWidget(confidenceBox);
 
+        auto* cameraRow = new QHBoxLayout;
+        cameraRow->addWidget(new QLabel("Camera ID"));
+        camId_ = new QLineEdit(initialCamId);
+        camId_->setPlaceholderText("camera-01");
+        cameraRow->addWidget(camId_, 1);
+        right->addLayout(cameraRow);
+
         auto* pickerRow = new QHBoxLayout;
         addButton_ = new QPushButton("Add media files...");
         clearButton_ = new QPushButton("Clear");
@@ -126,9 +144,31 @@ public:
             workerStatus_->setStyleSheet("color: red;");
         });
 
+        ffmpegPath_ = std::move(ffmpegPath);
+        decoder_ = new QProcess(this);
+        decoder_->setProcessChannelMode(QProcess::SeparateChannels);
+        connect(decoder_, &QProcess::readyReadStandardOutput, this, [this] { readDecodedAudio(); });
+        connect(decoder_, &QProcess::readyReadStandardError, this, [this] {
+            decoderErrorBuffer_ += decoder_->readAllStandardError();
+        });
+        connect(decoder_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [this](int exitCode, QProcess::ExitStatus status) {
+            if (stoppingDecoder_) return;
+            readDecodedAudio();
+            finishDecodedAudio(exitCode, status);
+        });
+        connect(decoder_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+            if (stoppingDecoder_) return;
+            workerStatus_->setText("FFmpeg error: " + decoder_->errorString());
+            workerStatus_->setStyleSheet("color: red;");
+        });
+
         connect(addButton_, &QPushButton::clicked, this, [this] { addFiles(); });
         connect(clearButton_, &QPushButton::clicked, this, [this] {
             player_->stop();
+            stopDecoder(true);
+            waitingForFirstResult_ = false;
+            playButton_->setEnabled(true);
             playlist_->clear();
             files_.clear();
             frames_.clear();
@@ -140,11 +180,32 @@ public:
             playIndex(0);
         });
         connect(playButton_, &QPushButton::clicked, this, [this] {
-            if (player_->playbackState() == QMediaPlayer::PlayingState) player_->pause();
-            else player_->play();
+            if (waitingForFirstResult_) return;
+            if (player_->playbackState() == QMediaPlayer::PlayingState) {
+                player_->pause();
+                setDecoderPaused(true);
+            } else {
+                if (decoder_->state() == QProcess::NotRunning &&
+                    !restartCurrentAudioStream(player_->position(), true)) return;
+                player_->play();
+                setDecoderPaused(false);
+            }
         });
-        connect(stopButton_, &QPushButton::clicked, player_, &QMediaPlayer::stop);
+        connect(stopButton_, &QPushButton::clicked, this, [this] {
+            player_->stop();
+            stopDecoder(true);
+            waitingForFirstResult_ = false;
+            playButton_->setEnabled(true);
+        });
         connect(position_, &QSlider::sliderMoved, player_, &QMediaPlayer::setPosition);
+        connect(position_, &QSlider::sliderPressed, this, [this] {
+            seekWasPlaying_ = player_->playbackState() == QMediaPlayer::PlayingState;
+            if (seekWasPlaying_) player_->pause();
+            setDecoderPaused(true);
+        });
+        connect(position_, &QSlider::sliderReleased, this, [this] {
+            restartCurrentAudioStream(player_->position(), seekWasPlaying_);
+        });
         connect(player_, &QMediaPlayer::positionChanged, this, [this](qint64 position) {
             if (!position_->isSliderDown()) position_->setValue(static_cast<int>(position));
             updateAtPosition(position);
@@ -171,6 +232,7 @@ public:
     }
 
     ~MainWindow() override {
+        stopDecoder(true);
         worker_->closeWriteChannel();
         if (!worker_->waitForFinished(1500)) {
             worker_->terminate();
@@ -209,19 +271,168 @@ private:
     void playIndex(int index) {
         if (index < 0 || index >= files_.size() || !workerReady_) return;
         currentIndex_ = index;
-        currentRequest_++;
-        frames_.clear();
         playlist_->setCurrentRow(index);
-        showScores({0.0, 0.0, 0.0});
-        const QJsonObject request{
-            {"id", static_cast<qint64>(currentRequest_)},
-            {"path", files_[index]},
-        };
-        worker_->write(QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n');
         player_->setSource(QUrl::fromLocalFile(files_[index]));
-        player_->play();
-        workerStatus_->setText("Analyzing " + QFileInfo(files_[index]).fileName() + "...");
+        player_->setPosition(0);
+        if (!restartCurrentAudioStream(0, true)) return;
+        workerStatus_->setText(
+            "Pre-rolling first timestamped result for " + QFileInfo(files_[index]).fileName() + "...");
         workerStatus_->setStyleSheet(QString());
+    }
+
+    bool restartCurrentAudioStream(qint64 startTimestampMs, bool playAfterFirstResult) {
+        if (currentIndex_ < 0 || currentIndex_ >= files_.size() || !workerReady_) return false;
+        const QString selectedCamId = camId_->text().trimmed();
+        if (selectedCamId.isEmpty()) {
+            QMessageBox::warning(this, "Missing camera ID", "Enter a camera ID before starting.");
+            return false;
+        }
+        stopDecoder(true);
+        ++currentRequest_;
+        activeCamId_ = selectedCamId;
+        frames_.clear();
+        showScores({0.0, 0.0, 0.0});
+        waitingForFirstResult_ = true;
+        playAfterFirstResult_ = playAfterFirstResult;
+        playButton_->setEnabled(false);
+        startAudioStream(files_[currentIndex_], startTimestampMs);
+        if (!streamOpen_) {
+            waitingForFirstResult_ = false;
+            playButton_->setEnabled(true);
+        }
+        return streamOpen_;
+    }
+
+    void sendWorkerMessage(const QJsonObject& message) {
+        if (worker_->state() != QProcess::Running) {
+            workerStatus_->setText("Worker is not running");
+            workerStatus_->setStyleSheet("color: red;");
+            return;
+        }
+        const QByteArray line = QJsonDocument(message).toJson(QJsonDocument::Compact) + '\n';
+        if (worker_->write(line) < 0) {
+            workerStatus_->setText("Could not write audio packet to worker");
+            workerStatus_->setStyleSheet("color: red;");
+        }
+    }
+
+    void startAudioStream(const QString& path, qint64 startTimestampMs) {
+        decoderBuffer_.clear();
+        decoderErrorBuffer_.clear();
+        nextAudioTimestampMs_ = startTimestampMs;
+        decoderRequestId_ = currentRequest_;
+        decoderCamId_ = activeCamId_;
+        streamOpen_ = true;
+
+        sendWorkerMessage({
+            {"type", "stream_start"},
+            {"id", static_cast<qint64>(decoderRequestId_)},
+            {"cam_id", decoderCamId_},
+            {"timestamp_ms", startTimestampMs},
+        });
+
+        QStringList arguments{
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-re",
+        };
+        if (startTimestampMs > 0) {
+            arguments << "-ss" << QString::number(startTimestampMs / 1000.0, 'f', 3);
+        }
+        arguments << "-i" << path
+                  << "-vn"
+                  << "-map" << "0:a:0"
+                  << "-ac" << "1"
+                  << "-ar" << QString::number(kSampleRate)
+                  << "-c:a" << "pcm_s16le"
+                  << "-f" << "s16le"
+                  << "pipe:1";
+        decoder_->start(ffmpegPath_, arguments, QIODevice::ReadOnly);
+        if (!decoder_->waitForStarted(1500)) {
+            workerStatus_->setText("Could not start FFmpeg: " + decoder_->errorString());
+            workerStatus_->setStyleSheet("color: red;");
+            sendStreamEnd();
+        }
+    }
+
+    void readDecodedAudio() {
+        decoderBuffer_ += decoder_->readAllStandardOutput();
+        while (decoderBuffer_.size() >= kPacketBytes && streamOpen_) {
+            const QByteArray packet = decoderBuffer_.left(kPacketBytes);
+            decoderBuffer_.remove(0, kPacketBytes);
+            sendAudioPacket(packet);
+        }
+    }
+
+    void sendAudioPacket(const QByteArray& packet) {
+        if (!streamOpen_ || packet.size() != kPacketBytes) return;
+        sendWorkerMessage({
+            {"type", "audio"},
+            {"id", static_cast<qint64>(decoderRequestId_)},
+            {"cam_id", decoderCamId_},
+            {"timestamp_ms", nextAudioTimestampMs_},
+            {"sample_rate", kSampleRate},
+            {"channels", 1},
+            {"encoding", "s16le"},
+            {"audio_b64", QString::fromLatin1(packet.toBase64())},
+        });
+        nextAudioTimestampMs_ += kPacketMilliseconds;
+        if (worker_->bytesToWrite() > 4 * 1024 * 1024) {
+            workerStatus_->setText("Worker is slower than the 40 ms audio stream; packets are queued");
+            workerStatus_->setStyleSheet("color: #b06000; font-weight: 700;");
+        }
+    }
+
+    void sendStreamEnd() {
+        if (!streamOpen_) return;
+        sendWorkerMessage({
+            {"type", "stream_end"},
+            {"id", static_cast<qint64>(decoderRequestId_)},
+            {"cam_id", decoderCamId_},
+            {"timestamp_ms", nextAudioTimestampMs_},
+        });
+        streamOpen_ = false;
+    }
+
+    void finishDecodedAudio(int exitCode, QProcess::ExitStatus status) {
+        if (!streamOpen_) return;
+        if (!decoderBuffer_.isEmpty()) {
+            decoderBuffer_.append(QByteArray(kPacketBytes - decoderBuffer_.size(), '\0'));
+            sendAudioPacket(decoderBuffer_);
+            decoderBuffer_.clear();
+        }
+        sendStreamEnd();
+        if (status != QProcess::NormalExit || exitCode != 0) {
+            const QString detail = QString::fromUtf8(decoderErrorBuffer_).trimmed();
+            workerStatus_->setText("FFmpeg extraction failed" +
+                                   (detail.isEmpty() ? QString() : ": " + detail));
+            workerStatus_->setStyleSheet("color: red;");
+        }
+    }
+
+    void stopDecoder(bool closeStream) {
+        stoppingDecoder_ = true;
+        if (decoder_ && decoder_->state() != QProcess::NotRunning) {
+            const qint64 processId = decoder_->processId();
+            if (processId > 0) ::kill(static_cast<pid_t>(processId), SIGCONT);
+            decoder_->terminate();
+            if (!decoder_->waitForFinished(1000)) {
+                decoder_->kill();
+                decoder_->waitForFinished(1000);
+            }
+        }
+        stoppingDecoder_ = false;
+        decoderBuffer_.clear();
+        decoderErrorBuffer_.clear();
+        if (closeStream) sendStreamEnd();
+    }
+
+    void setDecoderPaused(bool paused) {
+        if (!decoder_ || decoder_->state() != QProcess::Running) return;
+        const qint64 processId = decoder_->processId();
+        if (processId <= 0) return;
+        ::kill(static_cast<pid_t>(processId), paused ? SIGSTOP : SIGCONT);
     }
 
     void readCallbacks() {
@@ -267,22 +478,54 @@ private:
         }
         const qint64 id = callback.value("id").toInteger(-1);
         if (id != currentRequest_) return;
-        if (event == "chunk") {
-            const qint64 start = callback.value("start_ms").toInteger();
-            const qint64 hop = callback.value("hop_ms").toInteger(40);
+        if (event == "stream_started") {
+            workerStatus_->setText(
+                "Receiving 40 ms packets for " + activeCamId_ + " (history prefilled with silence)...");
+            workerStatus_->setStyleSheet(QString());
+        } else if (event == "buffering") {
+            const qint64 bufferedMs = callback.value("buffered_ms").toInteger();
+            workerStatus_->setText(
+                QString("Buffering %1 / 10000 ms for %2...").arg(bufferedMs).arg(activeCamId_));
+            workerStatus_->setStyleSheet(QString());
+        } else if (event == "result") {
+            const qint64 timestampMs = callback.value("timestamp_ms").toInteger();
             const QJsonArray scores = callback.value("scores").toArray();
-            frames_.reserve(frames_.size() + scores.size());
-            for (qsizetype index = 0; index < scores.size(); ++index) {
-                const QJsonArray row = scores[index].toArray();
-                if (row.size() != 3) continue;
+            if (scores.size() == 3) {
                 frames_.push_back({
-                    start + static_cast<qint64>(index) * hop,
-                    {row[0].toDouble(), row[1].toDouble(), row[2].toDouble()},
+                    timestampMs,
+                    {scores[0].toDouble(), scores[1].toDouble(), scores[2].toDouble()},
                 });
             }
+            const qint64 processingMs = callback.value("processing_ms").toInteger();
+            const qint64 superseded = callback.value("superseded_packets").toInteger();
+            if (waitingForFirstResult_) {
+                waitingForFirstResult_ = false;
+                playButton_->setEnabled(true);
+                player_->setPosition(timestampMs);
+                if (playAfterFirstResult_) {
+                    player_->play();
+                    setDecoderPaused(false);
+                } else {
+                    setDecoderPaused(true);
+                }
+            }
+            const qint64 playbackLagMs = std::max<qint64>(0, player_->position() - timestampMs);
+            workerStatus_->setText(
+                QString("Live result for %1 at %2 ms (inference %3 ms, playback lag %4 ms, "
+                        "superseded %5)")
+                    .arg(activeCamId_).arg(timestampMs).arg(processingMs)
+                    .arg(playbackLagMs).arg(superseded));
+            workerStatus_->setStyleSheet(
+                playbackLagMs > 200 ? "color: #b06000; font-weight: 700;" :
+                                      "color: #198754; font-weight: 700;");
             updateAtPosition(player_->position());
         } else if (event == "complete") {
-            workerStatus_->setText("Analysis complete");
+            if (waitingForFirstResult_) {
+                waitingForFirstResult_ = false;
+                playButton_->setEnabled(true);
+                if (playAfterFirstResult_) player_->play();
+            }
+            workerStatus_->setText("Audio stream complete");
             workerStatus_->setStyleSheet("color: #198754; font-weight: 700;");
         } else if (event == "error") {
             workerStatus_->setText("Analysis error: " + callback.value("message").toString());
@@ -326,18 +569,32 @@ private:
     std::array<QLabel*, 3> classLabels_{};
     std::array<QLabel*, 3> confidenceLabels_{};
     QDoubleSpinBox* threshold_ = nullptr;
+    QLineEdit* camId_ = nullptr;
     QPushButton* addButton_ = nullptr;
     QPushButton* clearButton_ = nullptr;
     QPushButton* runButton_ = nullptr;
     QListWidget* playlist_ = nullptr;
     QLabel* workerStatus_ = nullptr;
     QProcess* worker_ = nullptr;
+    QProcess* decoder_ = nullptr;
     QByteArray callbackBuffer_;
+    QByteArray decoderBuffer_;
+    QByteArray decoderErrorBuffer_;
+    QString ffmpegPath_;
+    QString activeCamId_;
+    QString decoderCamId_;
     QStringList files_;
     QVector<ConfidenceFrame> frames_;
     int currentIndex_ = -1;
     qint64 currentRequest_ = 0;
+    qint64 decoderRequestId_ = -1;
+    qint64 nextAudioTimestampMs_ = 0;
     bool workerReady_ = false;
+    bool streamOpen_ = false;
+    bool stoppingDecoder_ = false;
+    bool seekWasPlaying_ = false;
+    bool waitingForFirstResult_ = false;
+    bool playAfterFirstResult_ = true;
 };
 
 }  // namespace
@@ -355,13 +612,17 @@ int main(int argc, char** argv) {
                       "/workspace/class_mapping.csv"});
     parser.addOption({"labels", "Path to the ordered 447-class label file", "path",
                       "/workspace/resources/ATST-F_strong_1.labels.txt"});
+    parser.addOption({"ffmpeg", "Path to FFmpeg used for 40 ms PCM extraction", "path", "ffmpeg"});
+    parser.addOption({"cam-id", "Initial camera/source identifier", "id", "camera-01"});
     parser.process(application);
 
     MainWindow window(
         parser.value("worker"),
         parser.value("engine"),
         parser.value("mapping"),
-        parser.value("labels")
+        parser.value("labels"),
+        parser.value("ffmpeg"),
+        parser.value("cam-id")
     );
     window.show();
     return application.exec();

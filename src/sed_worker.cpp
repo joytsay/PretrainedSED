@@ -4,29 +4,34 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <complex>
+#include <condition_variable>
 #include <cstring>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
+#include <thread>
 
 namespace {
 
 using json = nlohmann::json;
 constexpr int kSampleRate = 16000;
 constexpr int kChunkSamples = 160000;
+constexpr int kWindowMilliseconds = 10000;
+constexpr int kPacketMilliseconds = 40;
+constexpr int kPacketSamples = kSampleRate * kPacketMilliseconds / 1000;
 constexpr int kFftSize = 1024;
 constexpr int kHopSize = 160;
 constexpr int kMelBins = 64;
@@ -167,6 +172,14 @@ struct ClassMapping {
     std::array<std::vector<int>, kAggregateClasses> sourceIndices;
 };
 
+struct StreamState {
+    std::string camId;
+    std::deque<float> samples;
+    std::int64_t nextTimestampMs = 0;
+    std::int64_t lastTimestampMs = -1;
+    std::uint64_t packetsReceived = 0;
+};
+
 std::string trim(std::string value) {
     const auto first = value.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return {};
@@ -270,44 +283,59 @@ ClassMapping loadClassMapping(const std::string& mappingPath, const std::string&
     return mapping;
 }
 
-std::vector<float> decodeAudio(const std::string& path) {
-    int descriptors[2];
-    if (pipe(descriptors) != 0) throw std::runtime_error("pipe() failed");
-    const pid_t child = fork();
-    if (child < 0) throw std::runtime_error("fork() failed");
-    if (child == 0) {
-        close(descriptors[0]);
-        dup2(descriptors[1], STDOUT_FILENO);
-        close(descriptors[1]);
-        execlp("ffmpeg", "ffmpeg", "-v", "error", "-i", path.c_str(), "-vn",
-               "-ac", "1", "-ar", "16000", "-f", "f32le", "pipe:1",
-               static_cast<char*>(nullptr));
-        _exit(127);
+std::vector<std::uint8_t> decodeBase64(const std::string& encoded) {
+    static const std::array<int, 256> table = [] {
+        std::array<int, 256> values{};
+        values.fill(-1);
+        const std::string alphabet =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (std::size_t index = 0; index < alphabet.size(); ++index) {
+            values[static_cast<unsigned char>(alphabet[index])] = static_cast<int>(index);
+        }
+        return values;
+    }();
+
+    std::vector<std::uint8_t> decoded;
+    decoded.reserve(encoded.size() * 3 / 4);
+    std::uint32_t accumulator = 0;
+    int bits = -8;
+    for (const unsigned char character : encoded) {
+        if (character == '=') break;
+        const int value = table[character];
+        if (value < 0) throw std::runtime_error("audio_b64 contains invalid base64");
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if (bits >= 0) {
+            decoded.push_back(static_cast<std::uint8_t>((accumulator >> bits) & 0xff));
+            bits -= 8;
+        }
+    }
+    return decoded;
+}
+
+std::vector<float> decodePcm16Packet(const json& request) {
+    if (request.value("sample_rate", 0) != kSampleRate) {
+        throw std::runtime_error("Audio packet sample_rate must be 16000");
+    }
+    if (request.value("channels", 0) != 1) {
+        throw std::runtime_error("Audio packet channels must be 1");
+    }
+    if (request.value("encoding", std::string()) != "s16le") {
+        throw std::runtime_error("Audio packet encoding must be s16le");
+    }
+    const auto bytes = decodeBase64(request.at("audio_b64").get<std::string>());
+    if (bytes.size() != static_cast<std::size_t>(kPacketSamples * 2)) {
+        throw std::runtime_error(
+            "Each audio packet must contain exactly 640 mono s16le samples (1280 bytes)");
     }
 
-    close(descriptors[1]);
-    std::vector<float> samples;
-    std::array<char, 65536> buffer{};
-    std::vector<char> pending;
-    while (true) {
-        const ssize_t count = read(descriptors[0], buffer.data(), buffer.size());
-        if (count == 0) break;
-        if (count < 0) {
-            close(descriptors[0]);
-            throw std::runtime_error("Could not read decoded audio");
-        }
-        pending.insert(pending.end(), buffer.data(), buffer.data() + count);
+    std::vector<float> samples(kPacketSamples);
+    for (int index = 0; index < kPacketSamples; ++index) {
+        int value = static_cast<int>(bytes[index * 2]) |
+                    (static_cast<int>(bytes[index * 2 + 1]) << 8);
+        if (value >= 32768) value -= 65536;
+        samples[index] = static_cast<float>(value) / 32768.0F;
     }
-    close(descriptors[0]);
-    int status = 0;
-    waitpid(child, &status, 0);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        throw std::runtime_error("FFmpeg could not decode: " + path);
-    }
-    if (pending.size() % sizeof(float) != 0) throw std::runtime_error("FFmpeg returned truncated float audio");
-    samples.resize(pending.size() / sizeof(float));
-    std::memcpy(samples.data(), pending.data(), pending.size());
-    if (samples.empty()) throw std::runtime_error("No audio samples decoded from: " + path);
     return samples;
 }
 
@@ -400,56 +428,200 @@ std::vector<float> computeMel(const std::vector<float>& chunk) {
     return mel;
 }
 
-json aggregateScores(
+json aggregateFrame(
     const std::vector<float>& output,
     const ClassMapping& mapping,
-    int validFrames
+    int frame
 ) {
     json scores = json::array();
-    for (int frame = 0; frame < validFrames; ++frame) {
-        json row = json::array();
-        for (const auto& sourceIndices : mapping.sourceIndices) {
-            float score = 0.0F;
-            for (const int sourceIndex : sourceIndices) {
-                score += output[sourceIndex * kOutputFrames + frame];
-            }
-            row.push_back(std::min(score, 1.0F));
+    for (const auto& sourceIndices : mapping.sourceIndices) {
+        float score = 0.0F;
+        for (const int sourceIndex : sourceIndices) {
+            score += output[sourceIndex * kOutputFrames + frame];
         }
-        scores.push_back(std::move(row));
+        scores.push_back(std::min(score, 1.0F));
     }
     return scores;
 }
 
 void callback(const json& message) {
+    static std::mutex outputMutex;
+    const std::lock_guard<std::mutex> lock(outputMutex);
     std::cout << message.dump() << '\n' << std::flush;
 }
 
-void processRequest(TensorRtModel& model, const ClassMapping& mapping, const json& request) {
-    const std::int64_t id = request.at("id").get<std::int64_t>();
-    const std::string path = request.at("path").get<std::string>();
-    callback({{"event", "started"}, {"id", id}, {"path", path}});
-    const auto samples = decodeAudio(path);
-    const auto chunks = (samples.size() + kChunkSamples - 1) / kChunkSamples;
-    for (std::size_t chunkIndex = 0; chunkIndex < chunks; ++chunkIndex) {
-        const std::size_t offset = chunkIndex * kChunkSamples;
-        const std::size_t validSamples = std::min<std::size_t>(kChunkSamples, samples.size() - offset);
-        std::vector<float> chunk(kChunkSamples, 0.0F);
-        std::copy_n(samples.begin() + static_cast<std::ptrdiff_t>(offset), validSamples, chunk.begin());
-        const auto output = model.infer(computeMel(chunk));
-        const int validFrames = std::min(kOutputFrames,
-            std::max(1, static_cast<int>(std::ceil(validSamples * 25.0 / kSampleRate))));
-        callback({
-            {"event", "chunk"},
-            {"id", id},
-            {"start_ms", static_cast<std::int64_t>(chunkIndex) * 10000},
-            {"hop_ms", 40},
-            {"scores", aggregateScores(output, mapping, validFrames)},
-        });
+struct InferenceJob {
+    std::int64_t id = -1;
+    std::string camId;
+    std::int64_t timestampMs = 0;
+    std::vector<float> window;
+    std::uint64_t supersededPackets = 0;
+};
+
+class InferenceScheduler {
+public:
+    InferenceScheduler(TensorRtModel& model, const ClassMapping& mapping)
+        : model_(model), mapping_(mapping), thread_([this] { run(); }) {}
+
+    ~InferenceScheduler() {
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        condition_.notify_one();
+        thread_.join();
     }
-    callback({
-        {"event", "complete"},
-        {"id", id},
-        {"duration_ms", static_cast<std::int64_t>(samples.size() * 1000 / kSampleRate)},
+
+    void activate(std::int64_t id) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        activeStreams_.insert(id);
+        pending_.erase(
+            std::remove_if(pending_.begin(), pending_.end(),
+                           [id](const InferenceJob& job) { return job.id == id; }),
+            pending_.end());
+    }
+
+    void deactivate(std::int64_t id) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        activeStreams_.erase(id);
+        pending_.erase(
+            std::remove_if(pending_.begin(), pending_.end(),
+                           [id](const InferenceJob& job) { return job.id == id; }),
+            pending_.end());
+    }
+
+    void submit(InferenceJob job) {
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            if (activeStreams_.count(job.id) == 0) return;
+            const auto existing = std::find_if(
+                pending_.begin(), pending_.end(),
+                [&job](const InferenceJob& pending) { return pending.id == job.id; });
+            if (existing == pending_.end()) {
+                pending_.push_back(std::move(job));
+            } else {
+                job.supersededPackets = existing->supersededPackets + 1;
+                *existing = std::move(job);
+            }
+        }
+        condition_.notify_one();
+    }
+
+private:
+    void run() {
+        while (true) {
+            InferenceJob job;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                condition_.wait(lock, [this] { return stopping_ || !pending_.empty(); });
+                if (stopping_ && pending_.empty()) return;
+                job = std::move(pending_.front());
+                pending_.pop_front();
+            }
+
+            const auto started = std::chrono::steady_clock::now();
+            const auto output = model_.infer(computeMel(job.window));
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started);
+
+            const json result = {
+                {"event", "result"},
+                {"id", job.id},
+                {"cam_id", job.camId},
+                {"timestamp_ms", job.timestampMs},
+                {"window_start_ms", job.timestampMs + kPacketMilliseconds - kWindowMilliseconds},
+                {"window_end_ms", job.timestampMs + kPacketMilliseconds},
+                {"processing_ms", elapsed.count()},
+                {"superseded_packets", job.supersededPackets},
+                {"scores", aggregateFrame(output, mapping_, kOutputFrames - 1)},
+            };
+            const std::lock_guard<std::mutex> lock(mutex_);
+            if (activeStreams_.count(job.id) != 0) callback(result);
+        }
+    }
+
+    TensorRtModel& model_;
+    const ClassMapping& mapping_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::deque<InferenceJob> pending_;
+    std::unordered_set<std::int64_t> activeStreams_;
+    bool stopping_ = false;
+    std::thread thread_;
+};
+
+void processMessage(
+    InferenceScheduler& scheduler,
+    std::unordered_map<std::int64_t, StreamState>& streams,
+    const json& request
+) {
+    const std::string type = request.at("type").get<std::string>();
+    const std::int64_t id = request.at("id").get<std::int64_t>();
+    const std::string camId = request.at("cam_id").get<std::string>();
+    if (camId.empty()) throw std::runtime_error("cam_id must not be empty");
+
+    if (type == "stream_start") {
+        const std::int64_t startTimestampMs = request.at("timestamp_ms").get<std::int64_t>();
+        if (startTimestampMs < 0) throw std::runtime_error("timestamp_ms must not be negative");
+        StreamState stream;
+        stream.camId = camId;
+        stream.nextTimestampMs = startTimestampMs;
+        stream.samples.assign(kChunkSamples, 0.0F);
+        streams[id] = std::move(stream);
+        scheduler.activate(id);
+        callback({
+            {"event", "stream_started"},
+            {"id", id},
+            {"cam_id", camId},
+            {"packet_ms", kPacketMilliseconds},
+            {"window_ms", kWindowMilliseconds},
+            {"silence_prefill_ms", kWindowMilliseconds},
+        });
+        return;
+    }
+
+    const auto streamIterator = streams.find(id);
+    if (streamIterator == streams.end()) {
+        throw std::runtime_error("Unknown stream id; send stream_start before audio packets");
+    }
+    StreamState& stream = streamIterator->second;
+    if (stream.camId != camId) throw std::runtime_error("cam_id changed within a stream");
+
+    if (type == "stream_end") {
+        scheduler.deactivate(id);
+        callback({
+            {"event", "complete"},
+            {"id", id},
+            {"cam_id", camId},
+            {"packets_received", stream.packetsReceived},
+            {"last_timestamp_ms", stream.lastTimestampMs},
+        });
+        streams.erase(streamIterator);
+        return;
+    }
+    if (type != "audio") throw std::runtime_error("Unknown message type: " + type);
+
+    const std::int64_t timestampMs = request.at("timestamp_ms").get<std::int64_t>();
+    if (timestampMs < 0) throw std::runtime_error("timestamp_ms must not be negative");
+    if (timestampMs != stream.nextTimestampMs) {
+        throw std::runtime_error("Audio packet timestamps must increase by exactly 40 ms");
+    }
+
+    const auto packet = decodePcm16Packet(request);
+    stream.samples.insert(stream.samples.end(), packet.begin(), packet.end());
+    while (stream.samples.size() > static_cast<std::size_t>(kChunkSamples)) {
+        stream.samples.pop_front();
+    }
+    stream.lastTimestampMs = timestampMs;
+    stream.nextTimestampMs += kPacketMilliseconds;
+    ++stream.packetsReceived;
+
+    scheduler.submit({
+        id,
+        camId,
+        timestampMs,
+        std::vector<float>(stream.samples.begin(), stream.samples.end()),
+        0,
     });
 }
 
@@ -468,21 +640,37 @@ int main(int argc, char** argv) {
         const std::string labelsPath = argc >= 4 ? argv[3] : defaultLabels.string();
         const ClassMapping mapping = loadClassMapping(mappingPath, labelsPath);
         TensorRtModel model(enginePath);
+        InferenceScheduler scheduler(model, mapping);
         callback({
             {"event", "ready"},
             {"classes", {mapping.names[0], mapping.names[1], mapping.names[2]}},
             {"mapping", mappingPath},
+            {"sample_rate", kSampleRate},
+            {"channels", 1},
+            {"encoding", "s16le"},
+            {"packet_samples", kPacketSamples},
+            {"packet_ms", kPacketMilliseconds},
+            {"window_ms", kWindowMilliseconds},
+            {"silence_prefill_ms", kWindowMilliseconds},
         });
+        std::unordered_map<std::int64_t, StreamState> streams;
         std::string line;
         while (std::getline(std::cin, line)) {
             if (line.empty()) continue;
             std::int64_t id = -1;
+            std::string camId;
             try {
                 const auto request = json::parse(line);
                 id = request.value("id", -1);
-                processRequest(model, mapping, request);
+                camId = request.value("cam_id", std::string());
+                processMessage(scheduler, streams, request);
             } catch (const std::exception& error) {
-                callback({{"event", "error"}, {"id", id}, {"message", error.what()}});
+                callback({
+                    {"event", "error"},
+                    {"id", id},
+                    {"cam_id", camId},
+                    {"message", error.what()},
+                });
             }
         }
     } catch (const std::exception& error) {
