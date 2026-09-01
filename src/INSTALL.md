@@ -108,6 +108,10 @@ result always have the same dynamic length and matching order. Class order is
 the order in which each unique `class_name` first appears in
 `class_mapping.csv`.
 
+The Qt confidence panel sorts its visible rows by current confidence, with the
+highest score at the top. This affects only presentation; the worker's
+`classes` and `scores` arrays retain their stable CSV-defined order.
+
 The Qt testbed starts FFmpeg first and holds media playback at the requested
 position until the first result arrives. This one-inference pre-roll aligns the
 subsequent result timestamps with the video timeline. Pause and seek operations

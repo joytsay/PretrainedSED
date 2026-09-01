@@ -99,7 +99,7 @@ public:
         threshold_->setRange(0.0, 100.0);
         threshold_->setDecimals(1);
         threshold_->setSuffix("%");
-        threshold_->setValue(50.0);
+        threshold_->setValue(10.0);
         thresholdRow->addWidget(threshold_);
         confidenceLayout->addLayout(thresholdRow);
         right->addWidget(confidenceBox);
@@ -560,6 +560,7 @@ private:
         classRowWidgets_.clear();
         classLabels_.clear();
         confidenceLabels_.clear();
+        displayOrder_.clear();
 
         for (const QJsonValue value : classes) {
             auto* row = new QWidget;
@@ -576,6 +577,7 @@ private:
             classRowWidgets_.push_back(row);
             classLabels_.push_back(classLabel);
             confidenceLabels_.push_back(confidenceLabel);
+            displayOrder_.push_back(displayOrder_.size());
         }
     }
 
@@ -595,6 +597,20 @@ private:
                 QString("font-size: 24px; font-weight: 700; color: %1;").arg(color));
             confidenceLabels_[index]->setText(QString::number(score * 100.0, 'f', 1) + "%");
         }
+
+        QVector<int> sortedOrder;
+        sortedOrder.reserve(classLabels_.size());
+        for (int index = 0; index < classLabels_.size(); ++index) sortedOrder.push_back(index);
+        std::stable_sort(sortedOrder.begin(), sortedOrder.end(), [&scores](int left, int right) {
+            const double leftScore = left < scores.size() ? scores[left] : 0.0;
+            const double rightScore = right < scores.size() ? scores[right] : 0.0;
+            return leftScore > rightScore;
+        });
+        if (sortedOrder != displayOrder_) {
+            for (QWidget* row : classRowWidgets_) confidenceRows_->removeWidget(row);
+            for (const int index : sortedOrder) confidenceRows_->addWidget(classRowWidgets_[index]);
+            displayOrder_ = std::move(sortedOrder);
+        }
     }
 
     QMediaPlayer* player_ = nullptr;
@@ -608,6 +624,7 @@ private:
     QVector<QWidget*> classRowWidgets_;
     QVector<QLabel*> classLabels_;
     QVector<QLabel*> confidenceLabels_;
+    QVector<int> displayOrder_;
     QDoubleSpinBox* threshold_ = nullptr;
     QLineEdit* camId_ = nullptr;
     QPushButton* addButton_ = nullptr;
