@@ -87,12 +87,14 @@ public:
         confidenceRows_ = new QVBoxLayout(confidenceRowsWidget);
         confidenceRows_->setContentsMargins(0, 0, 0, 0);
         confidenceRows_->setAlignment(Qt::AlignTop);
-        auto* confidenceScroll = new QScrollArea;
-        confidenceScroll->setWidgetResizable(true);
-        confidenceScroll->setMinimumHeight(120);
-        confidenceScroll->setMaximumHeight(360);
-        confidenceScroll->setWidget(confidenceRowsWidget);
-        confidenceLayout->addWidget(confidenceScroll);
+        confidenceScroll_ = new QScrollArea;
+        confidenceScroll_->setWidgetResizable(true);
+        confidenceScroll_->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        confidenceScroll_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        confidenceScroll_->setMinimumHeight(120);
+        confidenceScroll_->setMaximumHeight(360);
+        confidenceScroll_->setWidget(confidenceRowsWidget);
+        confidenceLayout->addWidget(confidenceScroll_);
         auto* thresholdRow = new QHBoxLayout;
         thresholdRow->addWidget(new QLabel("Red threshold"));
         threshold_ = new QDoubleSpinBox;
@@ -564,6 +566,7 @@ private:
 
         for (const QJsonValue value : classes) {
             auto* row = new QWidget;
+            row->setMinimumHeight(40);
             auto* layout = new QHBoxLayout(row);
             layout->setContentsMargins(0, 0, 0, 0);
             auto* classLabel = new QLabel(value.toString());
@@ -579,6 +582,10 @@ private:
             confidenceLabels_.push_back(confidenceLabel);
             displayOrder_.push_back(displayOrder_.size());
         }
+        const int visibleRows = std::clamp(static_cast<int>(classes.size()), 1, 8);
+        const int panelHeight = visibleRows * 44 + 8;
+        confidenceScroll_->setMinimumHeight(panelHeight);
+        confidenceScroll_->setMaximumHeight(panelHeight);
     }
 
     void resetScores() {
@@ -620,6 +627,7 @@ private:
     QPushButton* stopButton_ = nullptr;
     QSlider* position_ = nullptr;
     QLabel* timeLabel_ = nullptr;
+    QScrollArea* confidenceScroll_ = nullptr;
     QVBoxLayout* confidenceRows_ = nullptr;
     QVector<QWidget*> classRowWidgets_;
     QVector<QLabel*> classLabels_;
