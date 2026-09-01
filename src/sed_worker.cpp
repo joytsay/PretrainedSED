@@ -37,7 +37,6 @@ constexpr int kHopSize = 160;
 constexpr int kMelBins = 64;
 constexpr int kMelFrames = 1001;
 constexpr int kModelClasses = 447;
-constexpr int kAggregateClasses = 3;
 constexpr int kOutputFrames = 250;
 constexpr double kPi = 3.14159265358979323846;
 
@@ -168,8 +167,8 @@ private:
 };
 
 struct ClassMapping {
-    std::array<std::string, kAggregateClasses> names;
-    std::array<std::vector<int>, kAggregateClasses> sourceIndices;
+    std::vector<std::string> names;
+    std::vector<std::vector<int>> sourceIndices;
 };
 
 struct StreamState {
@@ -254,11 +253,9 @@ ClassMapping loadClassMapping(const std::string& mappingPath, const std::string&
         int aggregateIndex = 0;
         if (aggregate == aggregateIndices.end()) {
             aggregateIndex = static_cast<int>(aggregateIndices.size());
-            if (aggregateIndex >= kAggregateClasses) {
-                throw std::runtime_error("The testbed requires exactly three aggregate classes");
-            }
             aggregateIndices.emplace(fields[0], aggregateIndex);
-            mapping.names[aggregateIndex] = fields[0];
+            mapping.names.push_back(fields[0]);
+            mapping.sourceIndices.emplace_back();
         } else {
             aggregateIndex = aggregate->second;
         }
@@ -275,10 +272,8 @@ ClassMapping loadClassMapping(const std::string& mappingPath, const std::string&
         }
         group.push_back(source->second);
     }
-    if (aggregateIndices.size() != kAggregateClasses) {
-        throw std::runtime_error(
-            "The testbed requires exactly three aggregate classes; found " +
-            std::to_string(aggregateIndices.size()));
+    if (mapping.names.empty()) {
+        throw std::runtime_error("class_mapping.csv must define at least one aggregate class");
     }
     return mapping;
 }
@@ -643,7 +638,7 @@ int main(int argc, char** argv) {
         InferenceScheduler scheduler(model, mapping);
         callback({
             {"event", "ready"},
-            {"classes", {mapping.names[0], mapping.names[1], mapping.names[2]}},
+            {"classes", mapping.names},
             {"mapping", mappingPath},
             {"sample_rate", kSampleRate},
             {"channels", 1},

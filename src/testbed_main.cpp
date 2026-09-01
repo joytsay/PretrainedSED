@@ -5,7 +5,6 @@
 #include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFileInfo>
-#include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QJsonArray>
@@ -19,14 +18,15 @@
 #include <QMessageBox>
 #include <QProcess>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QSlider>
 #include <QStatusBar>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QVideoWidget>
+#include <QVector>
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <csignal>
 #include <sys/types.h>
@@ -41,7 +41,7 @@ constexpr int kPacketBytes = kPacketSamples * 2;
 
 struct ConfidenceFrame {
     qint64 timeMs = 0;
-    std::array<double, 3> scores{};
+    QVector<double> scores;
 };
 
 class MainWindow final : public QMainWindow {
@@ -82,24 +82,26 @@ public:
         left->addLayout(transport);
 
         auto* confidenceBox = new QGroupBox("Aggregate confidence");
-        auto* confidenceLayout = new QGridLayout(confidenceBox);
-        const std::array<QString, 3> names{"Class 1", "Class 2", "Class 3"};
-        for (int index = 0; index < 3; ++index) {
-            classLabels_[index] = new QLabel(names[index]);
-            classLabels_[index]->setStyleSheet("font-size: 24px; font-weight: 700;");
-            confidenceLabels_[index] = new QLabel("0.0%");
-            confidenceLabels_[index]->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-            confidenceLabels_[index]->setStyleSheet("font-size: 24px; font-weight: 700;");
-            confidenceLayout->addWidget(classLabels_[index], index, 0);
-            confidenceLayout->addWidget(confidenceLabels_[index], index, 1);
-        }
-        confidenceLayout->addWidget(new QLabel("Red threshold"), 3, 0);
+        auto* confidenceLayout = new QVBoxLayout(confidenceBox);
+        auto* confidenceRowsWidget = new QWidget;
+        confidenceRows_ = new QVBoxLayout(confidenceRowsWidget);
+        confidenceRows_->setContentsMargins(0, 0, 0, 0);
+        confidenceRows_->setAlignment(Qt::AlignTop);
+        auto* confidenceScroll = new QScrollArea;
+        confidenceScroll->setWidgetResizable(true);
+        confidenceScroll->setMinimumHeight(120);
+        confidenceScroll->setMaximumHeight(360);
+        confidenceScroll->setWidget(confidenceRowsWidget);
+        confidenceLayout->addWidget(confidenceScroll);
+        auto* thresholdRow = new QHBoxLayout;
+        thresholdRow->addWidget(new QLabel("Red threshold"));
         threshold_ = new QDoubleSpinBox;
         threshold_->setRange(0.0, 100.0);
         threshold_->setDecimals(1);
         threshold_->setSuffix("%");
         threshold_->setValue(50.0);
-        confidenceLayout->addWidget(threshold_, 3, 1);
+        thresholdRow->addWidget(threshold_);
+        confidenceLayout->addLayout(thresholdRow);
         right->addWidget(confidenceBox);
 
         auto* cameraRow = new QHBoxLayout;
@@ -173,7 +175,7 @@ public:
             files_.clear();
             frames_.clear();
             runButton_->setEnabled(false);
-            showScores({0.0, 0.0, 0.0});
+            resetScores();
         });
         connect(runButton_, &QPushButton::clicked, this, [this] {
             if (!workerReady_ || files_.isEmpty()) return;
@@ -291,7 +293,7 @@ private:
         ++currentRequest_;
         activeCamId_ = selectedCamId;
         frames_.clear();
-        showScores({0.0, 0.0, 0.0});
+        resetScores();
         waitingForFirstResult_ = true;
         playAfterFirstResult_ = playAfterFirstResult;
         playButton_->setEnabled(false);
@@ -457,14 +459,12 @@ private:
         const QString event = callback.value("event").toString();
         if (event == "ready") {
             const QJsonArray classes = callback.value("classes").toArray();
-            if (classes.size() != 3) {
-                workerStatus_->setText("Worker mapping did not return exactly three classes");
+            if (classes.isEmpty()) {
+                workerStatus_->setText("Worker mapping did not return any classes");
                 workerStatus_->setStyleSheet("color: red;");
                 return;
             }
-            for (int index = 0; index < 3; ++index) {
-                classLabels_[index]->setText(classes[index].toString());
-            }
+            configureClasses(classes);
             workerReady_ = true;
             workerStatus_->setText("TensorRT callback worker ready");
             workerStatus_->setStyleSheet("color: #198754; font-weight: 700;");
@@ -490,11 +490,17 @@ private:
         } else if (event == "result") {
             const qint64 timestampMs = callback.value("timestamp_ms").toInteger();
             const QJsonArray scores = callback.value("scores").toArray();
-            if (scores.size() == 3) {
-                frames_.push_back({
-                    timestampMs,
-                    {scores[0].toDouble(), scores[1].toDouble(), scores[2].toDouble()},
-                });
+            if (scores.size() == classLabels_.size()) {
+                QVector<double> values;
+                values.reserve(scores.size());
+                for (const QJsonValue score : scores) values.push_back(score.toDouble());
+                frames_.push_back({timestampMs, std::move(values)});
+            } else {
+                workerStatus_->setText(
+                    QString("Worker returned %1 scores for %2 mapped classes")
+                        .arg(scores.size()).arg(classLabels_.size()));
+                workerStatus_->setStyleSheet("color: red;");
+                return;
             }
             const qint64 processingMs = callback.value("processing_ms").toInteger();
             const qint64 superseded = callback.value("superseded_packets").toInteger();
@@ -535,7 +541,7 @@ private:
 
     void updateAtPosition(qint64 position) {
         if (frames_.isEmpty()) {
-            showScores({0.0, 0.0, 0.0});
+            resetScores();
             return;
         }
         const auto iterator = std::upper_bound(
@@ -546,16 +552,48 @@ private:
         if (selected != frames_.cend()) showScores(selected->scores);
     }
 
-    void showScores(const std::array<double, 3>& scores) {
+    void configureClasses(const QJsonArray& classes) {
+        for (QWidget* row : classRowWidgets_) {
+            confidenceRows_->removeWidget(row);
+            row->deleteLater();
+        }
+        classRowWidgets_.clear();
+        classLabels_.clear();
+        confidenceLabels_.clear();
+
+        for (const QJsonValue value : classes) {
+            auto* row = new QWidget;
+            auto* layout = new QHBoxLayout(row);
+            layout->setContentsMargins(0, 0, 0, 0);
+            auto* classLabel = new QLabel(value.toString());
+            classLabel->setStyleSheet("font-size: 24px; font-weight: 700;");
+            auto* confidenceLabel = new QLabel("0.0%");
+            confidenceLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            confidenceLabel->setStyleSheet("font-size: 24px; font-weight: 700;");
+            layout->addWidget(classLabel, 1);
+            layout->addWidget(confidenceLabel);
+            confidenceRows_->addWidget(row);
+            classRowWidgets_.push_back(row);
+            classLabels_.push_back(classLabel);
+            confidenceLabels_.push_back(confidenceLabel);
+        }
+    }
+
+    void resetScores() {
+        showScores(QVector<double>(classLabels_.size(), 0.0));
+    }
+
+    void showScores(const QVector<double>& scores) {
         const double threshold = threshold_->value() / 100.0;
-        for (int index = 0; index < 3; ++index) {
-            const bool alarm = scores[index] > threshold;
+        for (qsizetype index = 0; index < classLabels_.size(); ++index) {
+            const double score = index < scores.size() ? scores[index] : 0.0;
+            const bool alarm = score > threshold;
             const QString color = alarm ? "#d00000" : "palette(text)";
             classLabels_[index]->setStyleSheet(
                 QString("font-size: 24px; font-weight: 700; color: %1;").arg(color));
             confidenceLabels_[index]->setStyleSheet(
                 QString("font-size: 24px; font-weight: 700; color: %1;").arg(color));
-            confidenceLabels_[index]->setText(QString::number(scores[index] * 100.0, 'f', 1) + "%");
+            confidenceLabels_[index]->setText(QString::number(score * 100.0, 'f', 1) + "%");
         }
     }
 
@@ -566,8 +604,10 @@ private:
     QPushButton* stopButton_ = nullptr;
     QSlider* position_ = nullptr;
     QLabel* timeLabel_ = nullptr;
-    std::array<QLabel*, 3> classLabels_{};
-    std::array<QLabel*, 3> confidenceLabels_{};
+    QVBoxLayout* confidenceRows_ = nullptr;
+    QVector<QWidget*> classRowWidgets_;
+    QVector<QLabel*> classLabels_;
+    QVector<QLabel*> confidenceLabels_;
     QDoubleSpinBox* threshold_ = nullptr;
     QLineEdit* camId_ = nullptr;
     QPushButton* addButton_ = nullptr;
@@ -608,7 +648,7 @@ int main(int argc, char** argv) {
     parser.addOption({"worker", "Path to atst_sed_worker", "path", "atst_sed_worker"});
     parser.addOption({"engine", "Path to ATST-F TensorRT engine", "path",
                       "/workspace/resources/ATST-F_strong_1.trt"});
-    parser.addOption({"mapping", "Path to the three-class aggregation CSV", "path",
+    parser.addOption({"mapping", "Path to the aggregate class mapping CSV", "path",
                       "/workspace/class_mapping.csv"});
     parser.addOption({"labels", "Path to the ordered 447-class label file", "path",
                       "/workspace/resources/ATST-F_strong_1.labels.txt"});

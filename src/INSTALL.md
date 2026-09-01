@@ -9,15 +9,15 @@ The C++ implementation consists of two executables:
 - `atst_sed_testbed` is a Qt 6 frontend. It provides a multi-select media file
   picker and playlist, extracts 16 kHz mono PCM through FFmpeg in real time,
   supplies `cam_id` and media timestamps to the worker, plays audio/video, and
-  displays the three aggregate classes loaded by the worker. A class and
+  dynamically displays every aggregate class loaded by the worker. A class and
   percentage turn red above the selected threshold.
 
 All C++ sources are in this directory. The TensorRT engine consumes normalized
 ATST mel tensors shaped `[1,1,64,1001]` and returns `[1,447,250]` source
 probabilities. At startup, the worker reads `class_mapping.csv` and the ordered
-`ATST-F_strong_1.labels.txt` vocabulary produced by the converter. It requires
-exactly three aggregate classes, sums each class's configured sources, and caps
-the result at 100%.
+`ATST-F_strong_1.labels.txt` vocabulary produced by the converter. Every unique
+`class_name` in `class_mapping.csv` becomes an output class. The worker sums
+each class's configured sources and caps the result at 100%.
 
 ## Convert the model
 
@@ -102,6 +102,11 @@ can skip under load, but they remain close to the current media timestamp rather
 than drifting progressively behind it. The result timestamp is the start time
 of the newest 40 ms output frame. Negative initial `window_start_ms` values
 denote the silent history before the stream began.
+
+The `classes` array in the `ready` callback and the `scores` array in each
+result always have the same dynamic length and matching order. Class order is
+the order in which each unique `class_name` first appears in
+`class_mapping.csv`.
 
 The Qt testbed starts FFmpeg first and holds media playback at the requested
 position until the first result arrives. This one-inference pre-roll aligns the
