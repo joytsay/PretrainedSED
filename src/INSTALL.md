@@ -116,3 +116,5 @@ The Qt testbed starts FFmpeg first and holds media playback at the requested
 position until the first result arrives. This one-inference pre-roll aligns the
 subsequent result timestamps with the video timeline. Pause and seek operations
 also pause or restart the audio stream so the two timelines do not drift apart.
+The timeline supports both handle dragging and direct click-to-seek. After the
+last playlist item reaches end-of-media, playback wraps to the first item.

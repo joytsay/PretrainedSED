@@ -16,11 +16,14 @@
 #include <QMainWindow>
 #include <QMediaPlayer>
 #include <QMessageBox>
+#include <QMouseEvent>
 #include <QProcess>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSlider>
 #include <QStatusBar>
+#include <QStyle>
+#include <QStyleOptionSlider>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QVideoWidget>
@@ -44,6 +47,42 @@ struct ConfidenceFrame {
     QVector<double> scores;
 };
 
+class SeekSlider final : public QSlider {
+public:
+    explicit SeekSlider(Qt::Orientation orientation, QWidget* parent = nullptr)
+        : QSlider(orientation, parent) {}
+
+protected:
+    void mousePressEvent(QMouseEvent* event) override {
+        if (event->button() != Qt::LeftButton || orientation() != Qt::Horizontal) {
+            QSlider::mousePressEvent(event);
+            return;
+        }
+
+        QStyleOptionSlider option;
+        initStyleOption(&option);
+        const QRect handle = style()->subControlRect(
+            QStyle::CC_Slider, &option, QStyle::SC_SliderHandle, this);
+        if (handle.contains(event->position().toPoint())) {
+            QSlider::mousePressEvent(event);
+            return;
+        }
+
+        const int handleLength = style()->pixelMetric(
+            QStyle::PM_SliderLength, &option, this);
+        const int available = std::max(1, width() - handleLength);
+        const int clicked = std::clamp(
+            static_cast<int>(event->position().x()) - handleLength / 2, 0, available);
+        const int target = QStyle::sliderValueFromPosition(
+            minimum(), maximum(), clicked, available, option.upsideDown);
+        emit sliderPressed();
+        setValue(target);
+        emit sliderMoved(target);
+        emit sliderReleased();
+        event->accept();
+    }
+};
+
 class MainWindow final : public QMainWindow {
 public:
     MainWindow(
@@ -54,7 +93,7 @@ public:
         QString ffmpegPath,
         QString initialCamId
     ) {
-        setWindowTitle("ATST-F Aggregate SED Testbed");
+        setWindowTitle("GeoVision Sound Event Detection");
         resize(1180, 760);
 
         auto* central = new QWidget;
@@ -72,7 +111,7 @@ public:
         auto* transport = new QHBoxLayout;
         playButton_ = new QPushButton("Play");
         stopButton_ = new QPushButton("Stop");
-        position_ = new QSlider(Qt::Horizontal);
+        position_ = new SeekSlider(Qt::Horizontal);
         position_->setRange(0, 0);
         timeLabel_ = new QLabel("00:00 / 00:00");
         transport->addWidget(playButton_);
@@ -208,7 +247,7 @@ public:
             setDecoderPaused(true);
         });
         connect(position_, &QSlider::sliderReleased, this, [this] {
-            restartCurrentAudioStream(player_->position(), seekWasPlaying_);
+            restartCurrentAudioStream(position_->value(), seekWasPlaying_);
         });
         connect(player_, &QMediaPlayer::positionChanged, this, [this](qint64 position) {
             if (!position_->isSliderDown()) position_->setValue(static_cast<int>(position));
@@ -223,8 +262,8 @@ public:
             playButton_->setText(state == QMediaPlayer::PlayingState ? "Pause" : "Play");
         });
         connect(player_, &QMediaPlayer::mediaStatusChanged, this, [this](QMediaPlayer::MediaStatus status) {
-            if (status == QMediaPlayer::EndOfMedia && currentIndex_ + 1 < files_.size()) {
-                playIndex(currentIndex_ + 1);
+            if (status == QMediaPlayer::EndOfMedia && !files_.isEmpty()) {
+                playIndex((currentIndex_ + 1) % files_.size());
             }
         });
         connect(threshold_, &QDoubleSpinBox::valueChanged, this, [this] { updateAtPosition(player_->position()); });
