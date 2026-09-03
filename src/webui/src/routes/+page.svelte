@@ -14,7 +14,7 @@
     message?: string;
   };
 
-  type PlaylistItem = { file: File; url: string };
+  type PlaylistItem = { name: string; size: number; url: string; file?: File };
   type ScoreItem = { name: string; score: number; index: number };
 
   const SAMPLE_RATE = 16000;
@@ -121,6 +121,30 @@
     }
   }
 
+  async function loadDefaultVideos(): Promise<void> {
+    try {
+      const payload = await (await api('/api/videos')).json();
+      const defaults: PlaylistItem[] = (payload.videos ?? []).map(
+        (item: { name: string; size: number; url: string }) => ({
+          name: item.name,
+          size: item.size,
+          url: item.url
+        })
+      );
+      if (defaults.length) {
+        playlist = defaults;
+        await selectItem(0);
+        status = `Loaded ${defaults.length} media files from ${payload.root}`;
+        statusKind = '';
+      } else {
+        status = `No media files found in ${payload.root}`;
+        statusKind = 'warning';
+      }
+    } catch (error) {
+      showError(error);
+    }
+  }
+
   async function saveMapping(): Promise<void> {
     try {
       await stopStream();
@@ -154,7 +178,12 @@
 
   function addFiles(event: Event): void {
     const input = event.currentTarget as HTMLInputElement;
-    const additions = Array.from(input.files ?? []).map((file) => ({ file, url: URL.createObjectURL(file) }));
+    const additions = Array.from(input.files ?? []).map((file) => ({
+      name: file.name,
+      size: file.size,
+      file,
+      url: URL.createObjectURL(file)
+    }));
     playlist = [...playlist, ...additions];
     if (currentIndex < 0 && playlist.length) selectItem(0);
     input.value = '';
@@ -163,7 +192,9 @@
   async function clearPlaylist(): Promise<void> {
     video?.pause();
     await stopStream();
-    for (const item of playlist) URL.revokeObjectURL(item.url);
+    for (const item of playlist) {
+      if (item.file) URL.revokeObjectURL(item.url);
+    }
     playlist = [];
     currentIndex = -1;
     audioBuffer = null;
@@ -178,7 +209,7 @@
     currentIndex = index;
     audioBuffer = null;
     scores = classes.map(() => 0);
-    status = `Selected ${playlist[index].file.name}`;
+    status = `Selected ${playlist[index].name}`;
     statusKind = '';
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     video.load();
@@ -188,12 +219,15 @@
     if (audioBuffer) return audioBuffer;
     if (!currentItem) throw new Error('Choose at least one video or audio file');
     decoding = true;
-    status = `Decoding audio from ${currentItem.file.name}…`;
+    status = `Decoding audio from ${currentItem.name}…`;
     try {
       const AudioContextConstructor = window.AudioContext ?? window.webkitAudioContext;
       if (!AudioContextConstructor) throw new Error('This browser does not provide Web Audio');
       const context = new AudioContextConstructor();
-      audioBuffer = await context.decodeAudioData(await currentItem.file.arrayBuffer());
+      const encodedMedia = currentItem.file
+        ? await currentItem.file.arrayBuffer()
+        : await (await api(currentItem.url)).arrayBuffer();
+      audioBuffer = await context.decodeAudioData(encodedMedia);
       await context.close();
       return audioBuffer;
     } finally {
@@ -250,7 +284,7 @@
     const id = streamId;
     await sendMessage({ type: 'stream_start', id, cam_id: camId.trim(), timestamp_ms: timestamp });
     await sendNextPacket(buffer, id);
-    status = `Pre-rolling ${currentItem?.file.name ?? 'media'} at ${timestamp} ms…`;
+    status = `Pre-rolling ${currentItem?.name ?? 'media'} at ${timestamp} ms…`;
   }
 
   async function sendNextPacket(buffer: AudioBuffer, id: number): Promise<void> {
@@ -390,6 +424,7 @@
 
   onMount(() => {
     void loadMapping();
+    void loadDefaultVideos();
     void pollEvents();
     pumpTimer = window.setInterval(() => void pumpPackets(), 20);
   });
@@ -397,7 +432,9 @@
   onDestroy(() => {
     stopped = true;
     if (pumpTimer !== undefined) window.clearInterval(pumpTimer);
-    for (const item of playlist) URL.revokeObjectURL(item.url);
+    for (const item of playlist) {
+      if (item.file) URL.revokeObjectURL(item.url);
+    }
     void stopStream();
   });
 </script>
@@ -405,7 +442,7 @@
 <svelte:head><meta name="description" content="Browser testbed for the ATST-F TensorRT sound event detector" /></svelte:head>
 
 <header class="topbar">
-  <div class="brand"><div class="mark">S</div><div><strong>ATST-F Live SED</strong><span>AGX callback testbed</span></div></div>
+  <div class="brand"><div class="mark">G</div><div><strong>GeoVision SED</strong><span>AGX callback testbed</span></div></div>
   <div class:online={connected && workerReady} class="connection">
     {connected ? (workerReady ? 'Worker ready' : 'Server connected') : 'Offline'}
   </div>
@@ -420,7 +457,7 @@
   <div class="studio">
     <div>
       <section class="panel preview-panel">
-        <div class="panel-head"><h2>Media preview</h2><small>{currentItem?.file.name ?? 'No media selected'}</small></div>
+        <div class="panel-head"><h2>Media preview</h2><small>{currentItem?.name ?? 'No media selected'}</small></div>
         <div class="video-shell">
           <!-- svelte-ignore a11y_media_has_caption -->
           <video bind:this={video} src={currentItem?.url ?? ''} controls playsinline
@@ -441,7 +478,7 @@
         {#if playlist.length}
           <ol class="playlist">
             {#each playlist as item, index}
-              <li><button class:active={index === currentIndex} onclick={() => void selectItem(index)}><span>{item.file.name}</span><small>{(item.file.size / 1048576).toFixed(1)} MB</small></button></li>
+              <li><button class:active={index === currentIndex} onclick={() => void selectItem(index)}><span>{item.name}</span><small>{(item.size / 1048576).toFixed(1)} MB</small></button></li>
             {/each}
           </ol>
         {/if}

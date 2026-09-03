@@ -90,15 +90,18 @@ Start it inside the AGX container:
   --mapping /workspace/class_mapping.csv \
   --labels /workspace/resources/ATST-F_strong_1.labels.txt \
   --web-root /workspace/src/webui/dist \
+  --videos-root /workspace/videos \
   --host 0.0.0.0 \
   --port 8080
 ```
 
-Open `http://AGX-IP:8080`, choose multiple media files, and press **Run
-current**. Files remain local to the browser: the frontend sends only 40 ms
-PCM analysis packets to the server. The playlist wraps back to its first item
-after the final item. Native video controls provide click/drag seeking; a seek
-starts a fresh timestamped worker stream and pre-rolls its first result.
+Open `http://AGX-IP:8080`. Supported media files directly inside
+`/workspace/videos` are loaded into the initial playlist automatically. You can
+also choose multiple browser-local media files and press **Run current**. Local
+files remain in the browser; the frontend sends only 40 ms PCM analysis packets
+to the server. The playlist wraps back to its first item after the final item.
+Native video controls provide click/drag seeking; a seek starts a fresh
+timestamped worker stream and pre-rolls its first result.
 
 The mapping editor supports reload, local CSV import/download, and validated
 save to the server path supplied by `--mapping`. Applying a mapping restarts

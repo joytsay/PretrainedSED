@@ -352,9 +352,11 @@ void sendAll(int fd, const std::string& value) {
 
 void respond(int fd, int status, const std::string& contentType, const std::string& body,
              const std::string& extraHeaders = {}) {
-    const char* reason = status == 200 ? "OK" : status == 204 ? "No Content" :
+    const char* reason = status == 200 ? "OK" : status == 206 ? "Partial Content" :
+                         status == 204 ? "No Content" :
                          status == 400 ? "Bad Request" : status == 404 ? "Not Found" :
-                         status == 405 ? "Method Not Allowed" : "Internal Server Error";
+                         status == 405 ? "Method Not Allowed" :
+                         status == 416 ? "Range Not Satisfiable" : "Internal Server Error";
     std::ostringstream output;
     output << "HTTP/1.1 " << status << ' ' << reason << "\r\n"
            << "Content-Type: " << contentType << "\r\n"
@@ -419,6 +421,45 @@ std::string queryValue(const std::string& target, const std::string& key) {
     return {};
 }
 
+std::string percentEncode(const std::string& value) {
+    constexpr char kHex[] = "0123456789ABCDEF";
+    std::string encoded;
+    for (const unsigned char c : value) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            encoded.push_back(static_cast<char>(c));
+        } else {
+            encoded.push_back('%');
+            encoded.push_back(kHex[c >> 4]);
+            encoded.push_back(kHex[c & 0x0f]);
+        }
+    }
+    return encoded;
+}
+
+int hexDigit(char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+std::string percentDecode(const std::string& value) {
+    std::string decoded;
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        if (value[index] != '%') {
+            decoded.push_back(value[index]);
+            continue;
+        }
+        if (index + 2 >= value.size()) throw std::runtime_error("Invalid media URL encoding");
+        const int high = hexDigit(value[index + 1]);
+        const int low = hexDigit(value[index + 2]);
+        if (high < 0 || low < 0) throw std::runtime_error("Invalid media URL encoding");
+        decoded.push_back(static_cast<char>((high << 4) | low));
+        index += 2;
+    }
+    return decoded;
+}
+
 std::string mimeType(const fs::path& path) {
     const std::string extension = lower(path.extension().string());
     if (extension == ".html") return "text/html; charset=utf-8";
@@ -427,13 +468,95 @@ std::string mimeType(const fs::path& path) {
     if (extension == ".svg") return "image/svg+xml";
     if (extension == ".png") return "image/png";
     if (extension == ".ico") return "image/x-icon";
+    if (extension == ".mp4" || extension == ".m4v") return "video/mp4";
+    if (extension == ".webm") return "video/webm";
+    if (extension == ".mov") return "video/quicktime";
+    if (extension == ".mkv") return "video/x-matroska";
+    if (extension == ".avi") return "video/x-msvideo";
+    if (extension == ".mp3") return "audio/mpeg";
+    if (extension == ".wav") return "audio/wav";
+    if (extension == ".flac") return "audio/flac";
+    if (extension == ".ogg" || extension == ".oga") return "audio/ogg";
+    if (extension == ".m4a") return "audio/mp4";
+    if (extension == ".aac") return "audio/aac";
     return "application/octet-stream";
+}
+
+bool isSupportedMedia(const fs::path& path) {
+    static const std::unordered_set<std::string> extensions{
+        ".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v",
+        ".wav", ".flac", ".mp3", ".ogg", ".oga", ".m4a", ".aac",
+    };
+    return extensions.find(lower(path.extension().string())) != extensions.end();
+}
+
+void respondFile(int fd, const fs::path& path, const std::string& rangeHeader) {
+    const std::uintmax_t size = fs::file_size(path);
+    std::uintmax_t start = 0;
+    std::uintmax_t end = size == 0 ? 0 : size - 1;
+    int status = 200;
+
+    if (!rangeHeader.empty() && size > 0) {
+        try {
+            if (rangeHeader.rfind("bytes=", 0) != 0 || rangeHeader.find(',') != std::string::npos) {
+                throw std::runtime_error("unsupported range");
+            }
+            const std::string range = rangeHeader.substr(6);
+            const auto dash = range.find('-');
+            if (dash == std::string::npos) throw std::runtime_error("invalid range");
+            const std::string first = range.substr(0, dash);
+            const std::string last = range.substr(dash + 1);
+            if (first.empty()) {
+                const std::uintmax_t suffix = std::stoull(last);
+                if (suffix == 0) throw std::runtime_error("invalid suffix range");
+                start = suffix >= size ? 0 : size - suffix;
+            } else {
+                start = std::stoull(first);
+                if (!last.empty()) end = std::min<std::uintmax_t>(std::stoull(last), size - 1);
+            }
+            if (start >= size || start > end) throw std::runtime_error("range outside file");
+            status = 206;
+        } catch (const std::exception&) {
+            respond(fd, 416, "text/plain", {},
+                    "Content-Range: bytes */" + std::to_string(size) + "\r\n");
+            return;
+        }
+    }
+
+    const std::uintmax_t contentLength = size == 0 ? 0 : end - start + 1;
+    std::ostringstream header;
+    header << "HTTP/1.1 " << status << (status == 206 ? " Partial Content" : " OK") << "\r\n"
+           << "Content-Type: " << mimeType(path) << "\r\n"
+           << "Content-Length: " << contentLength << "\r\n"
+           << "Accept-Ranges: bytes\r\n";
+    if (status == 206) {
+        header << "Content-Range: bytes " << start << '-' << end << '/' << size << "\r\n";
+    }
+    header << "Cache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    sendAll(fd, header.str());
+
+    if (contentLength == 0) return;
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return;
+    input.seekg(static_cast<std::streamoff>(start));
+    std::uintmax_t remaining = contentLength;
+    std::string buffer(64 * 1024, '\0');
+    while (remaining > 0 && input) {
+        const std::size_t wanted = static_cast<std::size_t>(
+            std::min<std::uintmax_t>(remaining, buffer.size()));
+        input.read(buffer.data(), static_cast<std::streamsize>(wanted));
+        const std::streamsize count = input.gcount();
+        if (count <= 0) break;
+        sendAll(fd, std::string(buffer.data(), static_cast<std::size_t>(count)));
+        remaining -= static_cast<std::uintmax_t>(count);
+    }
 }
 
 struct ServerConfig {
     std::string host = "0.0.0.0";
     int port = 8080;
     fs::path webRoot = "src/webui/dist";
+    fs::path videosRoot = "/workspace/videos";
     WorkerConfig worker;
 };
 
@@ -463,7 +586,7 @@ public:
                                      std::to_string(config_.port) + ": " + message);
         }
         gListenFd = server;
-        std::cout << "ATST-F web testbed listening on http://" << config_.host << ':'
+        std::cout << "GeoVision SED web testbed listening on http://" << config_.host << ':'
                   << config_.port << '\n';
         while (gRunning) {
             const int client = ::accept(server, nullptr, nullptr);
@@ -521,6 +644,8 @@ private:
             respond(fd, 200, "application/json", "{\"ok\":true}");
         } else if (path == "/api/mapping" && request.method == "GET") {
             respond(fd, 200, "text/csv; charset=utf-8", readTextFile(config_.worker.mapping));
+        } else if (path == "/api/videos" && request.method == "GET") {
+            respond(fd, 200, "application/json", listVideos().dump());
         } else if (path == "/api/mapping" && request.method == "PUT") {
             validateMapping(request.body, config_.worker.labels);
             const fs::path mappingPath = config_.worker.mapping;
@@ -536,11 +661,58 @@ private:
             respond(fd, 200, "application/json", "{\"ok\":true,\"restarting_worker\":true}");
         } else if (path.rfind("/api/", 0) == 0) {
             respond(fd, 404, "application/json", "{\"error\":\"API route not found\"}");
+        } else if (path.rfind("/media/", 0) == 0 && request.method == "GET") {
+            serveMedia(fd, request, path.substr(7));
         } else if (request.method == "GET") {
             serveStatic(fd, path);
         } else {
             respond(fd, 405, "application/json", "{\"error\":\"Method not allowed\"}");
         }
+    }
+
+    json listVideos() const {
+        json videos = json::array();
+        std::error_code error;
+        if (!fs::is_directory(config_.videosRoot, error)) {
+            return {{"root", config_.videosRoot.string()}, {"videos", videos}};
+        }
+        std::vector<fs::directory_entry> entries;
+        for (const auto& entry : fs::directory_iterator(config_.videosRoot, error)) {
+            if (error) break;
+            if (entry.is_symlink(error) || !entry.is_regular_file(error) ||
+                !isSupportedMedia(entry.path())) {
+                continue;
+            }
+            entries.push_back(entry);
+        }
+        std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
+            return lower(left.path().filename().string()) < lower(right.path().filename().string());
+        });
+        for (const auto& entry : entries) {
+            const std::string name = entry.path().filename().string();
+            videos.push_back({{"name", name},
+                              {"size", entry.file_size(error)},
+                              {"url", "/media/" + percentEncode(name)}});
+        }
+        return {{"root", config_.videosRoot.string()}, {"videos", videos}};
+    }
+
+    void serveMedia(int fd, const HttpRequest& request, const std::string& encodedName) const {
+        const std::string name = percentDecode(encodedName);
+        if (name.empty() || name == "." || name == ".." ||
+            name.find('/') != std::string::npos || name.find('\\') != std::string::npos) {
+            respond(fd, 404, "text/plain", "Not found");
+            return;
+        }
+        const fs::path file = config_.videosRoot / name;
+        std::error_code error;
+        if (fs::is_symlink(file, error) || !fs::is_regular_file(file, error) ||
+            !isSupportedMedia(file)) {
+            respond(fd, 404, "text/plain", "Not found");
+            return;
+        }
+        const auto range = request.headers.find("range");
+        respondFile(fd, file, range == request.headers.end() ? std::string() : range->second);
     }
 
     void serveStatic(int fd, std::string path) {
@@ -569,7 +741,8 @@ private:
 
 void printUsage(const char* executable) {
     std::cout << "Usage: " << executable << " --worker PATH --engine PATH --mapping PATH --labels PATH\n"
-              << "       [--host 0.0.0.0] [--port 8080] [--web-root src/webui/dist]\n";
+              << "       [--host 0.0.0.0] [--port 8080] [--web-root src/webui/dist]\n"
+              << "       [--videos-root /workspace/videos]\n";
 }
 
 ServerConfig parseArguments(int argc, char** argv) {
@@ -593,6 +766,7 @@ ServerConfig parseArguments(int argc, char** argv) {
         else if (option == "--host") config.host = value;
         else if (option == "--port") config.port = std::stoi(value);
         else if (option == "--web-root") config.webRoot = value;
+        else if (option == "--videos-root") config.videosRoot = value;
         else throw std::runtime_error("Unknown option: " + option);
     }
     if (config.port < 1 || config.port > 65535) throw std::runtime_error("Invalid port");
