@@ -1,0 +1,484 @@
+<script lang="ts">
+  import { onDestroy, onMount } from 'svelte';
+  import '../app.css';
+
+  type WorkerEvent = {
+    event: string;
+    id?: number;
+    cam_id?: string;
+    timestamp_ms?: number;
+    processing_ms?: number;
+    superseded_packets?: number;
+    scores?: number[];
+    classes?: string[];
+    message?: string;
+  };
+
+  type PlaylistItem = { file: File; url: string };
+  type ScoreItem = { name: string; score: number; index: number };
+
+  const SAMPLE_RATE = 16000;
+  const PACKET_MS = 40;
+  const PACKET_SAMPLES = 640;
+
+  let video: HTMLVideoElement;
+  let fileInput: HTMLInputElement;
+  let mappingInput: HTMLInputElement;
+  let playlist: PlaylistItem[] = [];
+  let currentIndex = -1;
+  let classes: string[] = [];
+  let scores: number[] = [];
+  let thresholdPercent = 10;
+  let camId = 'camera-01';
+  let mappingText = '';
+  let connected = false;
+  let workerReady = false;
+  let status = 'Connecting to callback worker…';
+  let statusKind: '' | 'error' | 'warning' = '';
+  let eventSequence = 0;
+  let audioBuffer: AudioBuffer | null = null;
+  let decoding = false;
+  let streamId: number | null = null;
+  let nextPacketTimestamp = 0;
+  let requestCounter = 0;
+  let packetSending = false;
+  let pendingAutoPlay = false;
+  let pumpTimer: number | undefined;
+  let stopped = false;
+  let seekWasPlaying = false;
+  let suppressSeekRestart = false;
+
+  $: currentItem = currentIndex >= 0 ? playlist[currentIndex] : null;
+  $: orderedScores = classes
+    .map((name, index): ScoreItem => ({ name, index, score: scores[index] ?? 0 }))
+    .sort((left, right) => right.score - left.score);
+  $: highest = orderedScores[0] ?? { name: 'Waiting for results', score: 0, index: 0 };
+  $: mappingClasses = aggregateNames(mappingText);
+
+  function colorFor(label: string): string {
+    let hash = 0;
+    for (let index = 0; index < label.length; index += 1) hash = (hash * 31 + label.charCodeAt(index)) >>> 0;
+    return `hsl(${hash % 360} 72% 58%)`;
+  }
+
+  function parseCsvRow(line: string): string[] {
+    const fields: string[] = [];
+    let field = '';
+    let quoted = false;
+    for (let index = 0; index < line.length; index += 1) {
+      const char = line[index];
+      if (quoted && char === '"' && line[index + 1] === '"') {
+        field += '"';
+        index += 1;
+      } else if (char === '"') {
+        quoted = !quoted;
+      } else if (char === ',' && !quoted) {
+        fields.push(field.trim());
+        field = '';
+      } else {
+        field += char;
+      }
+    }
+    fields.push(field.trim());
+    return fields;
+  }
+
+  function aggregateNames(csv: string): string[] {
+    const seen = new Set<string>();
+    const names: string[] = [];
+    for (const line of csv.split(/\r?\n/)) {
+      if (!line.trim() || line.trimStart().startsWith('#')) continue;
+      const fields = parseCsvRow(line);
+      if (fields[0]?.toLowerCase() === 'class_name') continue;
+      if (fields[0] && !seen.has(fields[0])) {
+        seen.add(fields[0]);
+        names.push(fields[0]);
+      }
+    }
+    return names;
+  }
+
+  async function api(path: string, options?: RequestInit): Promise<Response> {
+    const response = await fetch(path, options);
+    if (!response.ok) {
+      const body = await response.text();
+      try { throw new Error(JSON.parse(body).error ?? body); }
+      catch (error) {
+        if (error instanceof SyntaxError) throw new Error(body || `HTTP ${response.status}`);
+        throw error;
+      }
+    }
+    return response;
+  }
+
+  async function loadMapping(): Promise<void> {
+    try {
+      mappingText = await (await api('/api/mapping')).text();
+      status = `Loaded ${aggregateNames(mappingText).length} aggregate classes from class_mapping.csv`;
+      statusKind = '';
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  async function saveMapping(): Promise<void> {
+    try {
+      await stopStream();
+      workerReady = false;
+      status = 'Validating mapping and restarting worker…';
+      await api('/api/mapping', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'text/csv; charset=utf-8' },
+        body: mappingText
+      });
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  function downloadMapping(): void {
+    const url = URL.createObjectURL(new Blob([mappingText], { type: 'text/csv' }));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = 'class_mapping.csv';
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function importMapping(event: Event): Promise<void> {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (file) mappingText = await file.text();
+    input.value = '';
+  }
+
+  function addFiles(event: Event): void {
+    const input = event.currentTarget as HTMLInputElement;
+    const additions = Array.from(input.files ?? []).map((file) => ({ file, url: URL.createObjectURL(file) }));
+    playlist = [...playlist, ...additions];
+    if (currentIndex < 0 && playlist.length) selectItem(0);
+    input.value = '';
+  }
+
+  async function clearPlaylist(): Promise<void> {
+    video?.pause();
+    await stopStream();
+    for (const item of playlist) URL.revokeObjectURL(item.url);
+    playlist = [];
+    currentIndex = -1;
+    audioBuffer = null;
+    scores = classes.map(() => 0);
+    status = 'Playlist cleared';
+  }
+
+  async function selectItem(index: number): Promise<void> {
+    if (index < 0 || index >= playlist.length) return;
+    video?.pause();
+    await stopStream();
+    currentIndex = index;
+    audioBuffer = null;
+    scores = classes.map(() => 0);
+    status = `Selected ${playlist[index].file.name}`;
+    statusKind = '';
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    video.load();
+  }
+
+  async function decodeCurrent(): Promise<AudioBuffer> {
+    if (audioBuffer) return audioBuffer;
+    if (!currentItem) throw new Error('Choose at least one video or audio file');
+    decoding = true;
+    status = `Decoding audio from ${currentItem.file.name}…`;
+    try {
+      const AudioContextConstructor = window.AudioContext ?? window.webkitAudioContext;
+      if (!AudioContextConstructor) throw new Error('This browser does not provide Web Audio');
+      const context = new AudioContextConstructor();
+      audioBuffer = await context.decodeAudioData(await currentItem.file.arrayBuffer());
+      await context.close();
+      return audioBuffer;
+    } finally {
+      decoding = false;
+    }
+  }
+
+  function pcmPacket(buffer: AudioBuffer, timestampMs: number): string {
+    const bytes = new Uint8Array(PACKET_SAMPLES * 2);
+    const view = new DataView(bytes.buffer);
+    const sourceStart = timestampMs * buffer.sampleRate / 1000;
+    for (let sample = 0; sample < PACKET_SAMPLES; sample += 1) {
+      const sourcePosition = sourceStart + sample * buffer.sampleRate / SAMPLE_RATE;
+      const left = Math.floor(sourcePosition);
+      const fraction = sourcePosition - left;
+      let value = 0;
+      for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+        const data = buffer.getChannelData(channel);
+        const a = left < data.length ? data[left] : 0;
+        const b = left + 1 < data.length ? data[left + 1] : a;
+        value += a + (b - a) * fraction;
+      }
+      value = Math.max(-1, Math.min(1, value / Math.max(1, buffer.numberOfChannels)));
+      view.setInt16(sample * 2, value < 0 ? Math.round(value * 32768) : Math.round(value * 32767), true);
+    }
+    let binary = '';
+    for (let offset = 0; offset < bytes.length; offset += 1) binary += String.fromCharCode(bytes[offset]);
+    return btoa(binary);
+  }
+
+  async function sendMessage(message: Record<string, unknown>): Promise<void> {
+    await api('/api/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(message)
+    });
+  }
+
+  function newStreamId(): number {
+    requestCounter = (requestCounter + 1) % 1000;
+    return Date.now() * 1000 + requestCounter;
+  }
+
+  async function startAnalysis(positionSeconds = 0, autoPlay = true): Promise<void> {
+    if (!workerReady) throw new Error('The TensorRT worker is not ready');
+    if (!camId.trim()) throw new Error('Camera ID must not be empty');
+    video.pause();
+    await stopStream();
+    const buffer = await decodeCurrent();
+    const timestamp = Math.max(0, Math.floor(positionSeconds * 1000 / PACKET_MS) * PACKET_MS);
+    streamId = newStreamId();
+    nextPacketTimestamp = timestamp;
+    pendingAutoPlay = autoPlay;
+    const id = streamId;
+    await sendMessage({ type: 'stream_start', id, cam_id: camId.trim(), timestamp_ms: timestamp });
+    await sendNextPacket(buffer, id);
+    status = `Pre-rolling ${currentItem?.file.name ?? 'media'} at ${timestamp} ms…`;
+  }
+
+  async function sendNextPacket(buffer: AudioBuffer, id: number): Promise<void> {
+    const timestamp = nextPacketTimestamp;
+    await sendMessage({
+      type: 'audio', id, cam_id: camId.trim(), timestamp_ms: timestamp,
+      sample_rate: SAMPLE_RATE, channels: 1, encoding: 's16le',
+      audio_b64: pcmPacket(buffer, timestamp)
+    });
+    if (streamId === id) nextPacketTimestamp += PACKET_MS;
+  }
+
+  async function pumpPackets(): Promise<void> {
+    if (packetSending || streamId === null || !audioBuffer || !video || video.paused || video.ended) return;
+    packetSending = true;
+    const id = streamId;
+    try {
+      const target = Math.floor(video.currentTime * 1000 / PACKET_MS) * PACKET_MS;
+      while (streamId === id && nextPacketTimestamp <= target) await sendNextPacket(audioBuffer, id);
+    } catch (error) {
+      showError(error);
+    } finally {
+      packetSending = false;
+    }
+  }
+
+  async function stopStream(): Promise<void> {
+    const id = streamId;
+    streamId = null;
+    pendingAutoPlay = false;
+    if (id !== null) {
+      try {
+        await sendMessage({ type: 'stream_end', id, cam_id: camId.trim(), timestamp_ms: nextPacketTimestamp });
+      } catch {
+        // A mapping save may restart the worker before this close reaches it.
+      }
+    }
+  }
+
+  async function runCurrent(): Promise<void> {
+    try { await startAnalysis(video.currentTime || 0, true); }
+    catch (error) { showError(error); }
+  }
+
+  async function handleNativePlay(): Promise<void> {
+    if (streamId !== null || decoding) return;
+    try { await startAnalysis(video.currentTime, true); }
+    catch (error) { showError(error); }
+  }
+
+  function handleSeeking(): void {
+    seekWasPlaying = !video.paused;
+  }
+
+  async function handleSeeked(): Promise<void> {
+    if (suppressSeekRestart) {
+      suppressSeekRestart = false;
+      return;
+    }
+    if (streamId === null) return;
+    try { await startAnalysis(video.currentTime, seekWasPlaying); }
+    catch (error) { showError(error); }
+  }
+
+  async function handleEnded(): Promise<void> {
+    await stopStream();
+    if (!playlist.length) return;
+    await selectItem((currentIndex + 1) % playlist.length);
+    await startAnalysis(0, true);
+  }
+
+  async function pollEvents(): Promise<void> {
+    while (!stopped) {
+      try {
+        const payload = await (await api(`/api/events?after=${eventSequence}`)).json();
+        connected = true;
+        eventSequence = payload.next ?? eventSequence;
+        for (const envelope of payload.events ?? []) handleWorkerEvent(envelope.data as WorkerEvent);
+      } catch (error) {
+        connected = false;
+        if (!stopped) {
+          status = `Server connection lost: ${error instanceof Error ? error.message : String(error)}`;
+          statusKind = 'error';
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
+    }
+  }
+
+  function handleWorkerEvent(event: WorkerEvent): void {
+    if (event.event === 'ready') {
+      classes = event.classes ?? [];
+      scores = classes.map(() => 0);
+      workerReady = classes.length > 0;
+      status = `TensorRT worker ready · ${classes.length} aggregate classes`;
+      statusKind = '';
+      return;
+    }
+    if (event.event === 'worker_restarting') {
+      workerReady = false;
+      status = 'Restarting worker with saved mapping…';
+      return;
+    }
+    if (event.event === 'fatal' || event.event === 'server_error') {
+      workerReady = false;
+      status = event.message ?? 'Worker failed';
+      statusKind = 'error';
+      return;
+    }
+    if (event.event === 'worker_log') return;
+    if (event.id !== streamId) return;
+    if (event.event === 'error') {
+      status = event.message ?? 'Analysis failed';
+      statusKind = 'error';
+    } else if (event.event === 'result' && event.scores?.length === classes.length) {
+      scores = [...event.scores];
+      const timestamp = event.timestamp_ms ?? 0;
+      const lag = Math.max(0, Math.round(video.currentTime * 1000) - timestamp);
+      status = `${event.cam_id} · ${timestamp} ms · inference ${event.processing_ms ?? 0} ms · playback lag ${lag} ms · superseded ${event.superseded_packets ?? 0}`;
+      statusKind = lag > 200 ? 'warning' : '';
+      if (pendingAutoPlay) {
+        pendingAutoPlay = false;
+        suppressSeekRestart = true;
+        video.currentTime = timestamp / 1000;
+        video.play().catch(() => {
+          status = 'Analysis is ready. Press play to continue (browser autoplay was blocked).';
+          statusKind = 'warning';
+        });
+      }
+    }
+  }
+
+  function showError(error: unknown): void {
+    status = error instanceof Error ? error.message : String(error);
+    statusKind = 'error';
+  }
+
+  onMount(() => {
+    void loadMapping();
+    void pollEvents();
+    pumpTimer = window.setInterval(() => void pumpPackets(), 20);
+  });
+
+  onDestroy(() => {
+    stopped = true;
+    if (pumpTimer !== undefined) window.clearInterval(pumpTimer);
+    for (const item of playlist) URL.revokeObjectURL(item.url);
+    void stopStream();
+  });
+</script>
+
+<svelte:head><meta name="description" content="Browser testbed for the ATST-F TensorRT sound event detector" /></svelte:head>
+
+<header class="topbar">
+  <div class="brand"><div class="mark">S</div><div><strong>ATST-F Live SED</strong><span>AGX callback testbed</span></div></div>
+  <div class:online={connected && workerReady} class="connection">
+    {connected ? (workerReady ? 'Worker ready' : 'Server connected') : 'Offline'}
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div><p class="eyebrow">CONTINUOUS SOUND EVENT DETECTION</p><h1>See what the model hears.</h1><p>Local browser preview with timestamped 40 ms audio streaming to the TensorRT callback worker.</p></div>
+    <div class="hero-note">The worker keeps its 10-second rolling window while the browser owns playback, seeking, and playlist looping.</div>
+  </section>
+
+  <div class="studio">
+    <div>
+      <section class="panel preview-panel">
+        <div class="panel-head"><h2>Media preview</h2><small>{currentItem?.file.name ?? 'No media selected'}</small></div>
+        <div class="video-shell">
+          <!-- svelte-ignore a11y_media_has_caption -->
+          <video bind:this={video} src={currentItem?.url ?? ''} controls playsinline
+            onplay={() => void handleNativePlay()} onseeking={handleSeeking} onseeked={() => void handleSeeked()} onended={() => void handleEnded()}></video>
+          {#if !currentItem}<div class="empty-video">Choose one or more video/audio files</div>{/if}
+        </div>
+        <div class="controls-grid">
+          <label>Camera ID<input bind:value={camId} placeholder="camera-01" /></label>
+          <label>Alert threshold <span>{thresholdPercent.toFixed(1)}%</span><input type="range" min="0" max="100" step="0.5" bind:value={thresholdPercent} /></label>
+          <label>Packet cadence<input value="40 ms" disabled /></label>
+        </div>
+        <div class="buttons">
+          <input bind:this={fileInput} class="file-native" type="file" multiple accept="video/*,audio/*" onchange={addFiles} />
+          <button class="primary" onclick={() => fileInput.click()}>Add media files</button>
+          <button onclick={() => void runCurrent()} disabled={!currentItem || !workerReady || decoding}>Run current</button>
+          <button class="danger" onclick={() => void clearPlaylist()} disabled={!playlist.length}>Clear</button>
+        </div>
+        {#if playlist.length}
+          <ol class="playlist">
+            {#each playlist as item, index}
+              <li><button class:active={index === currentIndex} onclick={() => void selectItem(index)}><span>{item.file.name}</span><small>{(item.file.size / 1048576).toFixed(1)} MB</small></button></li>
+            {/each}
+          </ol>
+        {/if}
+        <div class:error={statusKind === 'error'} class:warning={statusKind === 'warning'} class="status">{status}</div>
+      </section>
+
+      <section class="panel mapping-panel">
+        <div class="panel-head"><h2>class_mapping.csv</h2><small>{mappingClasses.length} aggregate labels</small></div>
+        <p class="hero-note" style="max-width:none;text-align:left">Each row maps a model source class into an aggregate output class. Saving validates the CSV and restarts the worker.</p>
+        <div class="badge-list">
+          {#each mappingClasses as name}<span class="badge" style={`--label-color:${colorFor(name)}`}>{name}</span>{/each}
+        </div>
+        <textarea bind:value={mappingText} spellcheck="false" aria-label="Class mapping CSV"></textarea>
+        <div class="buttons">
+          <button class="primary" onclick={() => void saveMapping()}>Apply and save</button>
+          <button onclick={() => void loadMapping()}>Reload saved</button>
+          <input bind:this={mappingInput} class="file-native" type="file" accept=".csv,text/csv" onchange={(event) => void importMapping(event)} />
+          <button onclick={() => mappingInput.click()}>Import CSV</button>
+          <button onclick={downloadMapping}>Download CSV</button>
+        </div>
+      </section>
+    </div>
+
+    <section class="panel results-panel">
+      <div class="panel-head"><h2>Aggregate confidence</h2><small>{classes.length} live classes</small></div>
+      <div class:alarm={highest.score * 100 > thresholdPercent} class="highest">
+        <span>Highest score</span><strong><b>{highest.name}</b><b>{(highest.score * 100).toFixed(1)}%</b></strong>
+      </div>
+      <div class="scores">
+        {#each orderedScores as item}
+          <div class:alarm={item.score * 100 > thresholdPercent} class="score-row"
+            style={`--label-color:${colorFor(item.name)};--score:${Math.min(100, item.score * 100)}%`}>
+            <div class="score-line"><span>{item.name}</span><span>{(item.score * 100).toFixed(1)}%</span></div>
+            <div class="bar"><i></i></div>
+          </div>
+        {/each}
+      </div>
+    </section>
+  </div>
+</main>

@@ -20,6 +20,8 @@ RUN touch /etc/modules \
       libsndfile1-dev \
       libglib2.0-0 \
       libasound2-plugins \
+      curl \
+      xz-utils \
       git \
       build-essential \
       cmake \
@@ -42,6 +44,20 @@ RUN touch /etc/modules \
  && install -d -m 0700 /tmp/runtime-root \
  && rm -rf /var/lib/apt/lists/*
 
+# Vite 7 requires a newer Node.js than Ubuntu Noble currently packages. Avoid
+# a second Docker registry lookup by installing the official ARM64 release
+# archive directly and verifying it against Node.js's published SHA-256 sum.
+RUN curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 \
+      https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-arm64.tar.xz \
+      -o /tmp/node-v22.23.2-linux-arm64.tar.xz \
+ && echo 'fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8  /tmp/node-v22.23.2-linux-arm64.tar.xz' \
+      | sha256sum -c - \
+ && tar -xJf /tmp/node-v22.23.2-linux-arm64.tar.xz \
+      -C /usr/local --strip-components=1 --no-same-owner \
+ && rm -f /tmp/node-v22.23.2-linux-arm64.tar.xz \
+ && node --version \
+ && npm --version
+
 # The Jetson image provides Torch 2.8, but does not ship a compatible
 # torchaudio wheel. Build the matching ARM64/Python-3.12 package.
 RUN python3 -m pip install --upgrade pip 'setuptools<81' wheel \
@@ -50,7 +66,7 @@ RUN python3 -m pip install --upgrade pip 'setuptools<81' wheel \
  && cd /tmp/audio \
  && sed -i '1i#include <float.h>' \
       src/libtorchaudio/cuctc/src/ctc_prefix_decoder_kernel_v2.cu \
- && BUILD_VERSION=2.8.0 BUILD_SOX=1 TORCH_CUDA_ARCH_LIST=8.7 \
+ && BUILD_VERSION=2.8.0 BUILD_SOX=1 USE_FFMPEG=0 TORCH_CUDA_ARCH_LIST=8.7 \
       MAX_JOBS=4 python3 setup.py bdist_wheel --dist-dir /tmp/torchaudio-dist \
  && python3 -m pip install /tmp/torchaudio-dist/torchaudio-2.8.0-cp312-cp312-linux_aarch64.whl --no-deps \
  && rm -rf /tmp/audio /tmp/torchaudio-dist

@@ -1,6 +1,6 @@
 # C++ TensorRT aggregate SED testbed (Jetson AGX Orin)
 
-The C++ implementation consists of two executables:
+The C++ implementation consists of three executables:
 
 - `atst_sed_worker` is a persistent callback process. It receives timestamped
   40 ms mono PCM packets, maintains a silence-prefilled 10-second rolling
@@ -11,6 +11,12 @@ The C++ implementation consists of two executables:
   supplies `cam_id` and media timestamps to the worker, plays audio/video, and
   dynamically displays every aggregate class loaded by the worker. A class and
   percentage turn red above the selected threshold.
+- `atst_sed_web_testbed` is the non-Qt C++ server for the Svelte frontend in
+  `src/webui`. The browser provides the video/audio preview, playlist and audio
+  decoding. It resamples audio to 16 kHz mono, sends timestamped 40 ms packets
+  through the server to `atst_sed_worker`, and receives callback results by
+  long polling. The server also validates, saves and reloads
+  `class_mapping.csv`.
 
 All C++ sources are in this directory. The TensorRT engine consumes normalized
 ATST mel tensors shaped `[1,1,64,1001]` and returns `[1,447,250]` source
@@ -51,6 +57,19 @@ file on the target AGX rather than copying one built on an x86 workstation.
 
 ## Build
 
+Build the Svelte frontend once. The AGX Docker image includes Node.js 22 and
+`npm`, so these commands can run directly inside the container:
+
+```sh
+cd /workspace/src/webui
+npm ci
+npm run check
+npm run build
+```
+
+The static build is written to `src/webui/dist`. During frontend development,
+`npm run dev` proxies `/api` to the C++ server on port 8080.
+
 ```sh
 cmake -S /workspace -B /workspace/build-agx \
   -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -58,6 +77,37 @@ cmake --build /workspace/build-agx -j4
 ```
 
 ## Run the testbed
+
+### Non-Qt Svelte testbed
+
+The new browser testbed does not need X11, PulseAudio, Qt Multimedia or FFmpeg.
+Start it inside the AGX container:
+
+```sh
+/workspace/build-agx/atst_sed_web_testbed \
+  --worker /workspace/build-agx/atst_sed_worker \
+  --engine /workspace/resources/ATST-F_strong_1.trt \
+  --mapping /workspace/class_mapping.csv \
+  --labels /workspace/resources/ATST-F_strong_1.labels.txt \
+  --web-root /workspace/src/webui/dist \
+  --host 0.0.0.0 \
+  --port 8080
+```
+
+Open `http://AGX-IP:8080`, choose multiple media files, and press **Run
+current**. Files remain local to the browser: the frontend sends only 40 ms
+PCM analysis packets to the server. The playlist wraps back to its first item
+after the final item. Native video controls provide click/drag seeking; a seek
+starts a fresh timestamped worker stream and pre-rolls its first result.
+
+The mapping editor supports reload, local CSV import/download, and validated
+save to the server path supplied by `--mapping`. Applying a mapping restarts
+the worker so its dynamic `classes` array immediately matches the saved CSV.
+
+To build only the non-Qt programs on a machine without Qt, configure with
+`-DBUILD_QT_TESTBED=OFF`. This preserves the original Qt source and executable.
+
+### Original Qt testbed
 
 ```sh
 /workspace/build-agx/atst_sed_testbed \

@@ -3,24 +3,35 @@ project(atst_sed_testbed LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets)
+find_package(Threads REQUIRED)
+find_package(nlohmann_json 3.10 REQUIRED)
 
-add_executable(atst_sed_testbed
-    src/testbed_main.cpp
+option(BUILD_QT_TESTBED "Build the original Qt playlist testbed" ON)
+if(BUILD_QT_TESTBED)
+    set(CMAKE_AUTOMOC ON)
+    find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets)
+    add_executable(atst_sed_testbed
+        src/testbed_main.cpp
+    )
+    target_link_libraries(atst_sed_testbed PRIVATE
+        Qt6::Widgets
+        Qt6::Multimedia
+        Qt6::MultimediaWidgets
+    )
+endif()
+
+add_executable(atst_sed_web_testbed
+    src/web_testbed_server.cpp
 )
-target_link_libraries(atst_sed_testbed PRIVATE
-    Qt6::Widgets
-    Qt6::Multimedia
-    Qt6::MultimediaWidgets
+target_link_libraries(atst_sed_web_testbed PRIVATE
+    Threads::Threads
+    nlohmann_json::nlohmann_json
 )
 
 option(BUILD_TENSORRT_WORKER "Build the TensorRT callback worker" ON)
 if(BUILD_TENSORRT_WORKER)
     find_package(CUDAToolkit REQUIRED)
-    find_package(Threads REQUIRED)
-    find_package(nlohmann_json 3.10 REQUIRED)
     find_path(TENSORRT_INCLUDE_DIR NvInfer.h
         HINTS /usr/include/aarch64-linux-gnu /usr/include /usr/local/TensorRT/include)
     find_library(TENSORRT_LIBRARY nvinfer
@@ -41,8 +52,10 @@ if(BUILD_TENSORRT_WORKER)
     )
 endif()
 
-install(TARGETS atst_sed_testbed
-    RUNTIME DESTINATION bin)
+install(TARGETS atst_sed_web_testbed RUNTIME DESTINATION bin)
+if(TARGET atst_sed_testbed)
+    install(TARGETS atst_sed_testbed RUNTIME DESTINATION bin)
+endif()
 if(TARGET atst_sed_worker)
     install(TARGETS atst_sed_worker RUNTIME DESTINATION bin)
 endif()
