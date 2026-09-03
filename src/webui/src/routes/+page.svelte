@@ -58,7 +58,8 @@
   $: orderedScores = classes
     .map((name, index): ScoreItem => ({ name, index, score: scores[index] ?? 0 }))
     .sort((left, right) => right.score - left.score);
-  $: highest = orderedScores[0] ?? { name: 'Waiting for results', score: 0, index: 0 };
+  $: triggeredScores = orderedScores.filter((item) => item.score * 100 > thresholdPercent);
+  $: inactiveScores = orderedScores.filter((item) => item.score * 100 <= thresholdPercent);
   $: mappingClasses = aggregateNames(mappingText);
 
   function colorFor(label: string): string {
@@ -626,14 +627,29 @@
 
     <section class="results-panel">
       <div class="panel-head"><h1>Aggregate confidence</h1><small>{classes.length} live classes</small></div>
-      <div class:alarm={highest.score * 100 > thresholdPercent} class="highest">
-        <span>Highest score</span><strong><b>{categoryFor(highest.name).title}</b><b>{(highest.score * 100).toFixed(1)}%</b></strong>
+      <div class:active={triggeredScores.length > 0} class="triggered-events" aria-live="polite">
+        <span class="triggered-heading">Triggered Sounds Events</span>
+        {#if triggeredScores.length}
+          {#each triggeredScores as item (item.index)}
+            {@const category = categoryFor(item.name)}
+            {@const Icon = category.icon}
+            <div class="triggered-card" style={`--label-color:${category.color}`}>
+              <Icon size={31} strokeWidth={1.9} aria-hidden="true" />
+              <div class="triggered-copy">
+                <strong><b>{category.title}</b><b>{(item.score * 100).toFixed(1)}%</b></strong>
+                <span>{category.subtitle}</span>
+              </div>
+            </div>
+          {/each}
+        {:else}
+          <strong class="no-triggered-events">None</strong>
+        {/if}
       </div>
       <div class="scores">
-        {#each orderedScores as item (item.index)}
+        {#each inactiveScores as item (item.index)}
           {@const category = categoryFor(item.name)}
           {@const Icon = category.icon}
-          <div class:alarm={item.score * 100 > thresholdPercent} class="score-row"
+          <div class="score-row"
             style={`--label-color:${category.color};--score:${Math.min(100, item.score * 100)}%`}>
             <div class="category-icon" aria-hidden="true"><Icon size={34} strokeWidth={1.8} /></div>
             <div class="score-copy"><div class="score-line"><span>{category.title}</span><span>{(item.score * 100).toFixed(1)}%</span></div>
