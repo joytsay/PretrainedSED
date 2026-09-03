@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
+  import { AudioLines, Bomb, CarFront, Crosshair, Dog, GlassWater, Hammer, Siren } from '@lucide/svelte';
   import '../app.css';
 
   type WorkerEvent = {
@@ -64,6 +65,35 @@
     let hash = 0;
     for (let index = 0; index < label.length; index += 1) hash = (hash * 31 + label.charCodeAt(index)) >>> 0;
     return `hsl(${hash % 360} 72% 58%)`;
+  }
+
+  const categoryStyles = [
+    { key: 'emergency sounds', aliases: ['siren', 'scream', 'alarm', 'ambulance', 'emergency'], title: 'Emergency Sounds', subtitle: 'Siren / Scream', color: '#ff4148', icon: Siren },
+    { key: 'violence sounds', aliases: ['gunshot', 'gunfire', 'machine gun', 'battle cry', 'weapon', 'violence'], title: 'Violence Sounds', subtitle: 'Machine Gun / Gunshot / Battle Cry', color: '#8247ee', icon: Crosshair },
+    { key: 'vehicle noise', aliases: ['engine', 'revving', 'race car', 'car horn', 'traffic', 'vehicle noise'], title: 'Vehicle Noise', subtitle: 'Modified Vehicle Noise / Engine Revving', color: '#5276f5', icon: CarFront },
+    { key: 'glass breaking', aliases: ['glass', 'shatter'], title: 'Glass Breaking', subtitle: 'Glass Breaking', color: '#79e88d', icon: GlassWater },
+    { key: 'impact sounds', aliases: ['impact', 'collision', 'crash', 'smash', 'thump', 'thud', 'heavy object drop'], title: 'Impact Sounds', subtitle: 'Vehicle Collision / Heavy Object Drop', color: '#f47c20', icon: Hammer },
+    { key: 'explosion sounds', aliases: ['explosion', 'firecracker', 'firework', 'blast', 'detonation'], title: 'Explosion Sounds', subtitle: 'Explosion / Firecracker / Fireworks', color: '#ff3e43', icon: Bomb },
+    { key: 'animal sounds', aliases: ['animal', 'dog', 'bark', 'canidae', 'wolf'], title: 'Animal Sounds', subtitle: 'Dog Bark', color: '#269957', icon: Dog }
+  ];
+
+  function categoryFor(name: string) {
+    const normalized = name.trim().toLowerCase();
+    const openParenthesis = name.indexOf('(');
+    const title = (openParenthesis >= 0 ? name.slice(0, openParenthesis) : name).trim();
+    const subtitle = openParenthesis >= 0
+      ? name.slice(openParenthesis + 1).replace(/\)\s*$/, '').trim()
+      : name;
+    const key = title.toLowerCase();
+    const exact = categoryStyles.find((item) => item.key === key);
+    if (exact) return exact;
+
+    const similar = categoryStyles.find((item) =>
+      item.aliases.some((alias) => normalized.includes(alias))
+    );
+    if (similar) return { ...similar, title, subtitle };
+
+    return { title, subtitle, color: colorFor(name), icon: AudioLines };
   }
 
   function parseCsvRow(line: string): string[] {
@@ -539,18 +569,13 @@
 <svelte:head><meta name="description" content="Browser testbed for the ATST-F TensorRT sound event detector" /></svelte:head>
 
 <header class="topbar">
-  <div class="brand"><div class="mark">G</div><div><strong>GeoVision SED</strong><span>AGX callback testbed</span></div></div>
+  <div class="brand"><div class="mark">G</div><div><strong>GeoVision SED</strong><span>Sound Event Detection</span></div></div>
   <div class:online={connected && workerReady} class="connection">
     {connected ? (workerReady ? 'Worker ready' : 'Server connected') : 'Offline'}
   </div>
 </header>
 
 <main>
-  <section class="hero">
-    <div><p class="eyebrow">CONTINUOUS SOUND EVENT DETECTION</p><h1>See what the model hears.</h1><p>Local browser preview with timestamped 40 ms audio streaming to the TensorRT callback worker.</p></div>
-    <div class="hero-note">The worker keeps its 10-second rolling window while the browser owns playback, seeking, and playlist looping.</div>
-  </section>
-
   <div class="studio">
     <div>
       <section class="panel preview-panel">
@@ -599,17 +624,20 @@
       </section>
     </div>
 
-    <section class="panel results-panel">
-      <div class="panel-head"><h2>Aggregate confidence</h2><small>{classes.length} live classes</small></div>
+    <section class="results-panel">
+      <div class="panel-head"><h1>Aggregate confidence</h1><small>{classes.length} live classes</small></div>
       <div class:alarm={highest.score * 100 > thresholdPercent} class="highest">
-        <span>Highest score</span><strong><b>{highest.name}</b><b>{(highest.score * 100).toFixed(1)}%</b></strong>
+        <span>Highest score</span><strong><b>{categoryFor(highest.name).title}</b><b>{(highest.score * 100).toFixed(1)}%</b></strong>
       </div>
       <div class="scores">
-        {#each orderedScores as item}
+        {#each orderedScores as item (item.index)}
+          {@const category = categoryFor(item.name)}
+          {@const Icon = category.icon}
           <div class:alarm={item.score * 100 > thresholdPercent} class="score-row"
-            style={`--label-color:${colorFor(item.name)};--score:${Math.min(100, item.score * 100)}%`}>
-            <div class="score-line"><span>{item.name}</span><span>{(item.score * 100).toFixed(1)}%</span></div>
-            <div class="bar"><i></i></div>
+            style={`--label-color:${category.color};--score:${Math.min(100, item.score * 100)}%`}>
+            <div class="category-icon" aria-hidden="true"><Icon size={34} strokeWidth={1.8} /></div>
+            <div class="score-copy"><div class="score-line"><span>{category.title}</span><span>{(item.score * 100).toFixed(1)}%</span></div>
+              <div class="subtitle">{category.subtitle}</div><div class="bar"><i></i></div></div>
           </div>
         {/each}
       </div>

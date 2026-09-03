@@ -45,7 +45,7 @@ if(BUILD_SVELTE_UI)
         add_custom_command(
             OUTPUT ${SED_WEB_UI_OUTPUT}
             COMMAND ${CMAKE_COMMAND} -E env NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false
-                    sh -c "test -x node_modules/.bin/vite || npm ci; npm run build"
+                    sh -c "npm ci && npm run build"
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/webui
             DEPENDS ${SED_WEB_UI_SOURCES}
             COMMENT "Building GeoVision SED Svelte UI"

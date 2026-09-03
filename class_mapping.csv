@@ -1,16 +1,27 @@
 class_name,source_class
-Glass breaking,Glass
-Glass breaking,Glass shatter
-Gunshot,Machine gun
-Gunshot,Cap gun
-Gunshot,"Gunshot, gunfire"
-Siren,Police car (siren)
-Siren,Ambulance (siren)
-Siren,"Fire engine, fire truck (siren)"
-Dog, Bark
-Dog, Dog
-Dog, "Canidae, wild dogs, wolves"
-Screaming, "Battle cry"
-Screaming, Screaming
-"Race car, auto racing", "Race car, auto racing"
-"Race car, auto racing", "Accelerating, revving, vroom"
+Emergency Sounds(siren/scream),Police car (siren)
+Emergency Sounds(siren/scream),Ambulance (siren)
+Emergency Sounds(siren/scream),"Fire engine, fire truck (siren)"
+Emergency Sounds(siren/scream),Screaming
+
+Violence Sounds(Machine gun/Gunshot/Battle cry),Machine gun
+Violence Sounds(Machine gun/Gunshot/Battle cry),Cap gun
+Violence Sounds(Machine gun/Gunshot/Battle cry),"Gunshot, gunfire"
+Violence Sounds(Machine gun/Gunshot/Battle cry),Battle cry
+
+Vehicle Noise(Modified Vehicle Noise / Engine Revving),"Race car, auto racing"
+Vehicle Noise(Modified Vehicle Noise / Engine Revving),"Accelerating, revving, vroom"
+
+Glass Breaking,Glass
+Glass Breaking,Glass shatter
+
+Impact Sounds(Vehicle Collision / Heavy Object Drop),"Smash, crash"
+Impact Sounds(Vehicle Collision / Heavy Object Drop),"Thump, thud"
+
+Explosion Sounds(Explosion / Firecracker / Fireworks),Explosion
+Explosion Sounds(Explosion / Firecracker / Fireworks),Firecracker
+Explosion Sounds(Explosion / Firecracker / Fireworks),Fireworks
+
+Animal Sounds(Dog Bark),Bark
+Animal Sounds(Dog Bark),Dog
+Animal Sounds(Dog Bark),"Canidae, wild dogs, wolves"

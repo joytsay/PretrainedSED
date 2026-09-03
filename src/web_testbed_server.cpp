@@ -163,6 +163,8 @@ public:
         return {{"events", output}, {"next", sequence_}};
     }
 
+    void wakeAll() { condition_.notify_all(); }
+
 private:
     std::mutex mutex_;
     std::condition_variable condition_;
@@ -613,6 +615,11 @@ public:
             }).detach();
         }
         gListenFd = -1;
+        // SIGINT/SIGTERM makes the long-poll predicate true, but changing an
+        // atomic does not wake a condition variable by itself. Wake all
+        // /api/events requests so shutdown does not wait for their 20-second
+        // timeout before joining the active client threads.
+        events_.wakeAll();
         std::unique_lock<std::mutex> clientLock(clientMutex_);
         clientCondition_.wait(clientLock, [this] { return activeClients_ == 0; });
         clientLock.unlock();
