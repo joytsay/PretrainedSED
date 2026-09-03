@@ -47,6 +47,11 @@
   let stopped = false;
   let seekWasPlaying = false;
   let suppressSeekRestart = false;
+  let realtimeContext: AudioContext | null = null;
+  let realtimeSource: MediaElementAudioSourceNode | null = null;
+  let realtimeProcessor: ScriptProcessorNode | null = null;
+  let realtimeSamples: number[] = [];
+  let realtimePacketChain = Promise.resolve();
 
   $: currentItem = currentIndex >= 0 ? playlist[currentIndex] : null;
   $: orderedScores = classes
@@ -202,7 +207,7 @@
     status = 'Playlist cleared';
   }
 
-  async function selectItem(index: number): Promise<void> {
+  async function selectItem(index: number, autoPlay = false): Promise<void> {
     if (index < 0 || index >= playlist.length) return;
     video?.pause();
     await stopStream();
@@ -213,6 +218,19 @@
     statusKind = '';
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     video.load();
+    if (autoPlay) {
+      // Start muted to satisfy browser autoplay policy, then restore sound once
+      // playback has begun. The media source is still routed directly to the
+      // speakers by setupRealtimeAudio().
+      video.muted = true;
+      try {
+        await video.play();
+        video.muted = false;
+      } catch (error) {
+        video.muted = false;
+        showError(error);
+      }
+    }
   }
 
   async function decodeCurrent(): Promise<AudioBuffer> {
@@ -258,6 +276,18 @@
     return btoa(binary);
   }
 
+  function pcmFloatPacket(samples: number[]): string {
+    const bytes = new Uint8Array(PACKET_SAMPLES * 2);
+    const view = new DataView(bytes.buffer);
+    for (let index = 0; index < PACKET_SAMPLES; index += 1) {
+      const value = Math.max(-1, Math.min(1, samples[index] ?? 0));
+      view.setInt16(index * 2, value < 0 ? Math.round(value * 32768) : Math.round(value * 32767), true);
+    }
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary);
+  }
+
   async function sendMessage(message: Record<string, unknown>): Promise<void> {
     await api('/api/message', {
       method: 'POST',
@@ -271,9 +301,72 @@
     return Date.now() * 1000 + requestCounter;
   }
 
+  async function setupRealtimeAudio(): Promise<AudioContext> {
+    const AudioContextConstructor = window.AudioContext ?? window.webkitAudioContext;
+    if (!AudioContextConstructor) throw new Error('This browser does not provide Web Audio');
+    if (!realtimeContext) {
+      realtimeContext = new AudioContextConstructor({ sampleRate: SAMPLE_RATE });
+      realtimeSource = realtimeContext.createMediaElementSource(video);
+      realtimeProcessor = realtimeContext.createScriptProcessor(1024, 2, 1);
+      realtimeSource.connect(realtimeProcessor);
+      // Keep an independent, reliable audio path. Some WebAudio
+      // implementations produce a silent ScriptProcessor output until its
+      // output buffer is explicitly filled.
+      realtimeSource.connect(realtimeContext.destination);
+      // Keep normal video playback audible while copying its audio to packets.
+      realtimeProcessor.connect(realtimeContext.destination);
+      realtimeProcessor.onaudioprocess = (event) => {
+        if (streamId === null) return;
+        const input = event.inputBuffer;
+        const channels = input.numberOfChannels;
+        const frames = input.length;
+        const first = input.getChannelData(0);
+        const second = channels > 1 ? input.getChannelData(1) : first;
+        for (let index = 0; index < frames; index += 1) {
+          realtimeSamples.push(channels > 1 ? (first[index] + second[index]) * 0.5 : first[index]);
+        }
+        const id = streamId;
+        while (realtimeSamples.length >= PACKET_SAMPLES && streamId === id) {
+          const packet = realtimeSamples.splice(0, PACKET_SAMPLES);
+          const timestamp = nextPacketTimestamp;
+          nextPacketTimestamp += PACKET_MS;
+          realtimePacketChain = realtimePacketChain.then(async () => {
+            if (streamId !== id) return;
+            await sendMessage({
+              type: 'audio', id, cam_id: camId.trim(), timestamp_ms: timestamp,
+              sample_rate: SAMPLE_RATE, channels: 1, encoding: 's16le',
+              audio_b64: pcmFloatPacket(packet)
+            });
+          }).catch(showError);
+        }
+      };
+    }
+    await realtimeContext.resume();
+    return realtimeContext;
+  }
+
+  async function startRealtimeAnalysis(positionSeconds: number, autoPlay: boolean): Promise<void> {
+    video.pause();
+    await stopStream();
+    await setupRealtimeAudio();
+    realtimeSamples = [];
+    realtimePacketChain = Promise.resolve();
+    streamId = newStreamId();
+    nextPacketTimestamp = Math.max(0, Math.floor(positionSeconds * 1000 / PACKET_MS) * PACKET_MS);
+    pendingAutoPlay = false;
+    const id = streamId;
+    await sendMessage({ type: 'stream_start', id, cam_id: camId.trim(), timestamp_ms: nextPacketTimestamp });
+    if (autoPlay) await video.play();
+    status = `Streaming live 40 ms audio from ${currentItem?.name ?? 'media'}…`;
+  }
+
   async function startAnalysis(positionSeconds = 0, autoPlay = true): Promise<void> {
     if (!workerReady) throw new Error('The TensorRT worker is not ready');
     if (!camId.trim()) throw new Error('Camera ID must not be empty');
+    if (currentItem && !currentItem.file) {
+      await startRealtimeAnalysis(positionSeconds, autoPlay);
+      return;
+    }
     video.pause();
     await stopStream();
     const buffer = await decodeCurrent();
@@ -315,6 +408,7 @@
     const id = streamId;
     streamId = null;
     pendingAutoPlay = false;
+    realtimeSamples = [];
     if (id !== null) {
       try {
         await sendMessage({ type: 'stream_end', id, cam_id: camId.trim(), timestamp_ms: nextPacketTimestamp });
@@ -435,6 +529,9 @@
     for (const item of playlist) {
       if (item.file) URL.revokeObjectURL(item.url);
     }
+    realtimeProcessor?.disconnect();
+    realtimeSource?.disconnect();
+    void realtimeContext?.close();
     void stopStream();
   });
 </script>
@@ -478,7 +575,7 @@
         {#if playlist.length}
           <ol class="playlist">
             {#each playlist as item, index}
-              <li><button class:active={index === currentIndex} onclick={() => void selectItem(index)}><span>{item.name}</span><small>{(item.size / 1048576).toFixed(1)} MB</small></button></li>
+              <li><button class:active={index === currentIndex} onclick={() => void selectItem(index, true)}><span>{item.name}</span><small>{(item.size / 1048576).toFixed(1)} MB</small></button></li>
             {/each}
           </ol>
         {/if}

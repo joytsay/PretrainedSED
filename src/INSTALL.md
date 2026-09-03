@@ -70,6 +70,10 @@ npm run build
 The static build is written to `src/webui/dist`. During frontend development,
 `npm run dev` proxies `/api` to the C++ server on port 8080.
 
+When `npm` is installed, the CMake target `atst_sed_web_testbed` also tracks
+the UI sources and rebuilds this static bundle automatically. The first such
+build runs `npm ci` if `src/webui/node_modules` is not present.
+
 ```sh
 cmake -S /workspace -B /workspace/build-agx \
   -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -102,6 +106,11 @@ files remain in the browser; the frontend sends only 40 ms PCM analysis packets
 to the server. The playlist wraps back to its first item after the final item.
 Native video controls provide click/drag seeking; a seek starts a fresh
 timestamped worker stream and pre-rolls its first result.
+
+Container-backed files from `--videos-root` are analyzed directly from the
+playing browser media element, so they do not need to be downloaded and fully
+decoded before playback. Browser-uploaded files use full-file Web Audio decode
+as a fallback.
 
 The mapping editor supports reload, local CSV import/download, and validated
 save to the server path supplied by `--mapping`. Applying a mapping restarts

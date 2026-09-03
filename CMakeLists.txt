@@ -29,6 +29,35 @@ target_link_libraries(atst_sed_web_testbed PRIVATE
     nlohmann_json::nlohmann_json
 )
 
+option(BUILD_SVELTE_UI "Build the Svelte web UI with the web testbed" ON)
+if(BUILD_SVELTE_UI)
+    find_program(NPM_EXECUTABLE npm)
+    if(NPM_EXECUTABLE)
+        file(GLOB_RECURSE SED_WEB_UI_SOURCES CONFIGURE_DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/webui/src/*
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/webui/package.json
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/webui/package-lock.json
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/webui/svelte.config.js
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/webui/vite.config.ts
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/webui/tsconfig.json
+        )
+        set(SED_WEB_UI_OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/src/webui/dist/index.html)
+        add_custom_command(
+            OUTPUT ${SED_WEB_UI_OUTPUT}
+            COMMAND ${CMAKE_COMMAND} -E env NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false
+                    sh -c "test -x node_modules/.bin/vite || npm ci; npm run build"
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/webui
+            DEPENDS ${SED_WEB_UI_SOURCES}
+            COMMENT "Building GeoVision SED Svelte UI"
+            VERBATIM
+        )
+        add_custom_target(atst_sed_webui DEPENDS ${SED_WEB_UI_OUTPUT})
+        add_dependencies(atst_sed_web_testbed atst_sed_webui)
+    else()
+        message(WARNING "npm not found; atst_sed_web_testbed will use the existing src/webui/dist build")
+    endif()
+endif()
+
 option(BUILD_TENSORRT_WORKER "Build the TensorRT callback worker" ON)
 if(BUILD_TENSORRT_WORKER)
     find_package(CUDAToolkit REQUIRED)
