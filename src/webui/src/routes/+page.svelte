@@ -370,7 +370,12 @@
       // Keep normal video playback audible while copying its audio to packets.
       realtimeProcessor.connect(realtimeContext.destination);
       realtimeProcessor.onaudioprocess = (event) => {
-        if (streamId === null) return;
+        if (streamId === null || video.paused) {
+          // Do not let Web Audio's callback clock run ahead of the media
+          // element while playback is paused.
+          realtimeSamples = [];
+          return;
+        }
         const input = event.inputBuffer;
         const channels = input.numberOfChannels;
         const frames = input.length;
@@ -385,7 +390,7 @@
           const timestamp = nextPacketTimestamp;
           nextPacketTimestamp += PACKET_MS;
           realtimePacketChain = realtimePacketChain.then(async () => {
-            if (streamId !== id) return;
+            if (streamId !== id || video.paused) return;
             await sendMessage({
               type: 'audio', id, cam_id: camId.trim(), timestamp_ms: timestamp,
               sample_rate: SAMPLE_RATE, channels: 1, encoding: 's16le',
@@ -478,7 +483,16 @@
   }
 
   async function handleNativePlay(): Promise<void> {
-    if (streamId !== null || decoding) return;
+    if (streamId !== null) {
+      // Resume the stream at the media timeline instead of sending packets
+      // accumulated while the element was paused.
+      realtimeSamples = [];
+      nextPacketTimestamp = Math.max(
+        0, Math.floor(video.currentTime * 1000 / PACKET_MS) * PACKET_MS
+      );
+      return;
+    }
+    if (decoding) return;
     try { await startAnalysis(video.currentTime, true); }
     catch (error) { showError(error); }
   }
@@ -509,6 +523,13 @@
       try {
         const payload = await (await api(`/api/events?after=${eventSequence}`)).json();
         connected = true;
+        // The server periodically compacts its bounded event log and resets
+        // its sequence.  Restart from zero so we receive the worker's ready
+        // callback again instead of staying stuck at the old cursor.
+        if (typeof payload.next === 'number' && payload.next < eventSequence) {
+          eventSequence = 0;
+          continue;
+        }
         eventSequence = payload.next ?? eventSequence;
         for (const envelope of payload.events ?? []) handleWorkerEvent(envelope.data as WorkerEvent);
       } catch (error) {
@@ -534,6 +555,13 @@
     if (event.event === 'worker_restarting') {
       workerReady = false;
       status = 'Restarting worker with saved mapping…';
+      return;
+    }
+    if (event.event === 'worker_sleeping') {
+      // Sleeping is an intentional low-power state. Keep the last class
+      // mapping usable: the next /api/message request starts the worker again.
+      status = event.message ?? 'Worker sleeping; it will wake on demand';
+      statusKind = 'warning';
       return;
     }
     if (event.event === 'fatal' || event.event === 'server_error') {

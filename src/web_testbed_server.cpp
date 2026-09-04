@@ -43,6 +43,13 @@ namespace fs = std::filesystem;
 constexpr std::size_t kMaxHeaderBytes = 64 * 1024;
 constexpr std::size_t kMaxBodyBytes = 4 * 1024 * 1024;
 constexpr std::size_t kMaxEvents = 4096;
+constexpr auto kWorkerIdleTimeout = std::chrono::minutes(5);
+
+std::int64_t steadyNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 std::atomic<bool> gRunning{true};
 std::atomic<int> gListenFd{-1};
@@ -144,6 +151,12 @@ class EventLog {
 public:
     std::uint64_t push(json value) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (events_.size() >= kMaxEvents) {
+            // A new browser must not be stranded behind an old sequence.  A
+            // zero sequence tells clients to restart their event cursor.
+            events_.clear();
+            sequence_ = 0;
+        }
         const std::uint64_t sequence = ++sequence_;
         events_.push_back({sequence, std::move(value)});
         while (events_.size() > kMaxEvents) events_.pop_front();
@@ -588,6 +601,8 @@ public:
                                      std::to_string(config_.port) + ": " + message);
         }
         gListenFd = server;
+        lastWorkerUseMs_ = steadyNowMs();
+        idleThread_ = std::thread([this] { monitorWorkerIdle(); });
         std::cout << "GeoVision SED web testbed listening on http://" << config_.host << ':'
                   << config_.port << '\n';
         while (gRunning) {
@@ -632,6 +647,8 @@ public:
         std::unique_lock<std::mutex> clientLock(clientMutex_);
         clientCondition_.wait(clientLock, [this] { return activeClients_ == 0; });
         clientLock.unlock();
+        idleStopping_ = true;
+        if (idleThread_.joinable()) idleThread_.join();
         worker_.stop();
     }
 
@@ -656,6 +673,8 @@ private:
         } else if (path == "/api/message" && request.method == "POST") {
             const json message = json::parse(request.body);
             if (!message.is_object()) throw std::runtime_error("Message must be a JSON object");
+            lastWorkerUseMs_ = steadyNowMs();
+            if (!worker_.running()) worker_.start();
             worker_.send(message);
             respond(fd, 200, "application/json", "{\"ok\":true}");
         } else if (path == "/api/mapping" && request.method == "GET") {
@@ -683,6 +702,20 @@ private:
             serveStatic(fd, path);
         } else {
             respond(fd, 405, "application/json", "{\"error\":\"Method not allowed\"}");
+        }
+    }
+
+    void monitorWorkerIdle() {
+        while (!idleStopping_) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            if (idleStopping_) break;
+            if (worker_.running() && steadyNowMs() - lastWorkerUseMs_.load() >
+                                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          kWorkerIdleTimeout).count()) {
+                worker_.stop();
+                events_.push({{"event", "worker_sleeping"},
+                              {"message", "Worker stopped after idle timeout"}});
+            }
         }
     }
 
@@ -754,6 +787,9 @@ private:
     std::condition_variable clientCondition_;
     std::size_t activeClients_ = 0;
     std::unordered_set<int> clientFds_;
+    std::atomic<bool> idleStopping_{false};
+    std::atomic<std::int64_t> lastWorkerUseMs_{0};
+    std::thread idleThread_;
 };
 
 void printUsage(const char* executable) {
