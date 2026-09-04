@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { AudioLines, Bomb, CarFront, Crosshair, Dog, GlassWater, Hammer, Siren } from '@lucide/svelte';
+  import SoundIcon from '../components/SoundIcon.svelte';
   import '../app.css';
   import displayNamesText from '../../../../mid_to_display_name.tsv?raw';
 
@@ -92,13 +92,13 @@
   }
 
   const categoryStyles = [
-    { key: 'emergency sounds', aliases: ['siren', 'scream', 'alarm', 'ambulance', 'emergency'], title: 'Emergency Sounds', subtitle: 'Siren / Scream', color: '#ff4148', icon: Siren },
-    { key: 'violence sounds', aliases: ['gunshot', 'gunfire', 'machine gun', 'battle cry', 'weapon', 'violence'], title: 'Violence Sounds', subtitle: 'Machine Gun / Gunshot / Battle Cry', color: '#8247ee', icon: Crosshair },
-    { key: 'vehicle noise', aliases: ['engine', 'revving', 'race car', 'car horn', 'traffic', 'vehicle noise'], title: 'Vehicle Noise', subtitle: 'Modified Vehicle Noise / Engine Revving', color: '#5276f5', icon: CarFront },
-    { key: 'glass breaking', aliases: ['glass', 'shatter'], title: 'Glass Breaking', subtitle: 'Glass Breaking', color: '#79e88d', icon: GlassWater },
-    { key: 'impact sounds', aliases: ['impact', 'collision', 'crash', 'smash', 'thump', 'thud', 'heavy object drop'], title: 'Impact Sounds', subtitle: 'Vehicle Collision / Heavy Object Drop', color: '#f47c20', icon: Hammer },
-    { key: 'explosion sounds', aliases: ['explosion', 'firecracker', 'firework', 'blast', 'detonation'], title: 'Explosion Sounds', subtitle: 'Explosion / Firecracker / Fireworks', color: '#ff3e43', icon: Bomb },
-    { key: 'animal sounds', aliases: ['animal', 'dog', 'bark', 'canidae', 'wolf'], title: 'Animal Sounds', subtitle: 'Dog Bark', color: '#269957', icon: Dog }
+    { key: 'emergency sounds', aliases: ['siren', 'scream', 'alarm', 'ambulance', 'emergency'], title: 'Emergency Sounds', subtitle: 'Siren / Scream', color: '#ff4148', icon: 'siren' },
+    { key: 'violence sounds', aliases: ['gunshot', 'gunfire', 'machine gun', 'battle cry', 'weapon', 'violence'], title: 'Violence Sounds', subtitle: 'Machine Gun / Gunshot / Battle Cry', color: '#8247ee', icon: 'violence' },
+    { key: 'vehicle noise', aliases: ['engine', 'revving', 'race car', 'car horn', 'traffic', 'vehicle noise'], title: 'Vehicle Noise', subtitle: 'Modified Vehicle Noise / Engine Revving', color: '#5276f5', icon: 'vehicle' },
+    { key: 'glass breaking', aliases: ['glass', 'shatter'], title: 'Glass Breaking', subtitle: 'Glass Breaking', color: '#79e88d', icon: 'glass' },
+    { key: 'impact sounds', aliases: ['impact', 'collision', 'crash', 'smash', 'thump', 'thud', 'heavy object drop'], title: 'Impact Sounds', subtitle: 'Vehicle Collision / Heavy Object Drop', color: '#f47c20', icon: 'impact' },
+    { key: 'explosion sounds', aliases: ['explosion', 'firecracker', 'firework', 'blast', 'detonation'], title: 'Explosion Sounds', subtitle: 'Explosion / Firecracker / Fireworks', color: '#ff3e43', icon: 'explosion' },
+    { key: 'animal sounds', aliases: ['animal', 'dog', 'bark', 'canidae', 'wolf'], title: 'Animal Sounds', subtitle: 'Dog Bark', color: '#269957', icon: 'animal' }
   ];
 
   function categoryFor(name: string) {
@@ -117,7 +117,7 @@
     );
     if (similar) return { ...similar, title, subtitle, color: colorFor(name) };
 
-    return { title, subtitle, color: colorFor(name), icon: AudioLines };
+    return { title, subtitle, color: colorFor(name), icon: 'audio' };
   }
 
   function parseCsvRow(line: string): string[] {
@@ -640,9 +640,8 @@
         {#if triggeredScores.length}
           {#each triggeredScores as item (item.index)}
             {@const category = categoryFor(item.name)}
-            {@const Icon = category.icon}
             <div class="triggered-card" style={`--label-color:${category.color}`}>
-              <Icon size={31} strokeWidth={1.9} aria-hidden="true" />
+              <SoundIcon kind={category.icon} size={31} strokeWidth={1.9} />
               <div class="triggered-copy">
                 <strong><b>{category.title}</b><b>{(item.score * 100).toFixed(1)}%</b></strong>
                 <span>{category.subtitle}</span>
@@ -656,10 +655,9 @@
       <div class="scores">
         {#each inactiveScores as item (item.index)}
           {@const category = categoryFor(item.name)}
-          {@const Icon = category.icon}
           <div class="score-row"
             style={`--label-color:${category.color};--score:${Math.min(100, item.score * 100)}%`}>
-            <div class="category-icon" aria-hidden="true"><Icon size={34} strokeWidth={1.8} /></div>
+            <div class="category-icon" aria-hidden="true"><SoundIcon kind={category.icon} size={34} strokeWidth={1.8} /></div>
             <div class="score-copy"><div class="score-line"><span>{category.title}</span><span>{(item.score * 100).toFixed(1)}%</span></div>
               <div class="subtitle">{category.subtitle}</div><div class="bar"><i></i></div></div>
           </div>
