@@ -2,6 +2,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { AudioLines, Bomb, CarFront, Crosshair, Dog, GlassWater, Hammer, Siren } from '@lucide/svelte';
   import '../app.css';
+  import displayNamesText from '../../../../mid_to_display_name.tsv?raw';
 
   type WorkerEvent = {
     event: string;
@@ -21,6 +22,13 @@
   const SAMPLE_RATE = 16000;
   const PACKET_MS = 40;
   const PACKET_SAMPLES = 640;
+  const displayNames = displayNamesText
+    .split(/\r?\n/)
+    .filter((line) => line.trim())
+    .map((line) => {
+      const [mid, ...nameParts] = line.split('\t');
+      return { mid, name: nameParts.join('\t') };
+    });
 
   let video: HTMLVideoElement;
   let fileInput: HTMLInputElement;
@@ -62,10 +70,25 @@
   $: inactiveScores = orderedScores.filter((item) => item.score * 100 <= thresholdPercent);
   $: mappingClasses = aggregateNames(mappingText);
 
+  const classPalette = [
+    '#ff4057', // red
+    '#ff8a2b', // orange
+    '#ffd43b', // yellow
+    '#35d277', // green
+    '#20d5df', // cyan
+    '#557cff', // blue
+    '#d64cff'  // magenta
+  ];
+
   function colorFor(label: string): string {
-    let hash = 0;
-    for (let index = 0; index < label.length; index += 1) hash = (hash * 31 + label.charCodeAt(index)) >>> 0;
-    return `hsl(${hash % 360} 72% 58%)`;
+    const mappedIndex = mappingClasses.indexOf(label);
+    if (mappedIndex >= 0) return classPalette[mappedIndex % classPalette.length];
+
+    // Keep a stable fallback while the mapping is still loading.
+    const fallbackIndex = Array.from(label).reduce(
+      (total, character) => total + (character.codePointAt(0) ?? 0), 0
+    );
+    return classPalette[fallbackIndex % classPalette.length];
   }
 
   const categoryStyles = [
@@ -87,12 +110,12 @@
       : name;
     const key = title.toLowerCase();
     const exact = categoryStyles.find((item) => item.key === key);
-    if (exact) return exact;
+    if (exact) return { ...exact, color: colorFor(name) };
 
     const similar = categoryStyles.find((item) =>
       item.aliases.some((alias) => normalized.includes(alias))
     );
-    if (similar) return { ...similar, title, subtitle };
+    if (similar) return { ...similar, title, subtitle, color: colorFor(name) };
 
     return { title, subtitle, color: colorFor(name), icon: AudioLines };
   }
@@ -607,26 +630,11 @@
         {/if}
         <div class:error={statusKind === 'error'} class:warning={statusKind === 'warning'} class="status">{status}</div>
       </section>
-
-      <section class="panel mapping-panel">
-        <div class="panel-head"><h2>class_mapping.csv</h2><small>{mappingClasses.length} aggregate labels</small></div>
-        <p class="hero-note" style="max-width:none;text-align:left">Each row maps a model source class into an aggregate output class. Saving validates the CSV and restarts the worker.</p>
-        <div class="badge-list">
-          {#each mappingClasses as name}<span class="badge" style={`--label-color:${colorFor(name)}`}>{name}</span>{/each}
-        </div>
-        <textarea bind:value={mappingText} spellcheck="false" aria-label="Class mapping CSV"></textarea>
-        <div class="buttons">
-          <button class="primary" onclick={() => void saveMapping()}>Apply and save</button>
-          <button onclick={() => void loadMapping()}>Reload saved</button>
-          <input bind:this={mappingInput} class="file-native" type="file" accept=".csv,text/csv" onchange={(event) => void importMapping(event)} />
-          <button onclick={() => mappingInput.click()}>Import CSV</button>
-          <button onclick={downloadMapping}>Download CSV</button>
-        </div>
-      </section>
     </div>
 
-    <section class="results-panel">
-      <div class="panel-head"><h1>Aggregate confidence</h1><small>{classes.length} live classes</small></div>
+    <div class="right-column">
+      <section class="results-panel">
+      <div class="panel-head"><h1>Sound Event Confidence</h1><small>{classes.length} live classes</small></div>
       <div class:active={triggeredScores.length > 0} class="triggered-events" aria-live="polite">
         <span class="triggered-heading">Triggered Sounds Events</span>
         {#if triggeredScores.length}
@@ -657,6 +665,34 @@
           </div>
         {/each}
       </div>
-    </section>
+      </section>
+
+      <details class="panel mapping-panel">
+        <summary class="mapping-summary"><strong>Class Mapping</strong><small>{mappingClasses.length} aggregate labels</small></summary>
+        <div class="mapping-content">
+          <p class="hero-note" style="max-width:none;text-align:left">Each row maps a model source class into an aggregate output class. Saving validates the CSV and restarts the worker.</p>
+          <div class="badge-list">
+            {#each mappingClasses as name}<span class="badge" style={`--label-color:${colorFor(name)}`}>{name}</span>{/each}
+          </div>
+          <textarea bind:value={mappingText} spellcheck="false" aria-label="Class mapping CSV"></textarea>
+          <div class="buttons">
+            <button class="primary" onclick={() => void saveMapping()}>Apply and save</button>
+            <button onclick={() => void loadMapping()}>Reload saved</button>
+            <input bind:this={mappingInput} class="file-native" type="file" accept=".csv,text/csv" onchange={(event) => void importMapping(event)} />
+            <button onclick={() => mappingInput.click()}>Import CSV</button>
+            <button onclick={downloadMapping}>Download CSV</button>
+          </div>
+          <details class="source-class-list">
+            <summary>List all source classes <span>{displayNames.length}</span></summary>
+            <div class="source-class-table">
+              <div class="source-class-heading"><span>MID</span><span>Display name</span></div>
+              {#each displayNames as item (item.mid)}
+                <div class="source-class-entry"><code>{item.mid}</code><span>{item.name}</span></div>
+              {/each}
+            </div>
+          </details>
+        </div>
+      </details>
+    </div>
   </div>
 </main>

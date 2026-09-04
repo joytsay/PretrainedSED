@@ -12,7 +12,8 @@ button,input,textarea { font:inherit } button { color:inherit }
 .connection::before { content:""; display:inline-block; width:6px; height:6px; margin-right:6px; border-radius:50%; background:#64748b }
 .connection.online::before { background:#61dc93; box-shadow:0 0 9px #61dc93 }
 main { max-width:1500px; min-width:0; margin:auto; padding:22px }
-.results-panel { min-width:0; padding:15px; position:sticky; top:75px; border:1px solid var(--line); border-radius:10px; background:#0b1728 }
+.right-column { min-width:0; display:grid; gap:13px; align-content:start; position:sticky; top:75px }
+.results-panel { min-width:0; padding:15px; border:1px solid var(--line); border-radius:10px; background:#0b1728 }
 .panel-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin:0 2px 11px }
 .panel-head h1,.panel-head h2 { margin:0; color:#f0f3fa; font-size:15px; line-height:20px; letter-spacing:-.01em }
 .panel-head small { color:#7d899f; font-size:13px }
@@ -53,7 +54,22 @@ button.primary { border:0; color:#041619; background:linear-gradient(135deg,#55d
 .playlist { display:grid; gap:6px; max-height:170px; margin:12px 0 0; padding:0; overflow:auto; list-style:none }.playlist button { width:100%; display:flex; justify-content:space-between; text-align:left; color:#c8d9ef }.playlist button.active { border-color:#55d9ca; background:rgba(66,232,213,.1) }
 .playlist small,.hero-note { color:var(--muted) }.hero-note { font-size:12px }
 .status { min-height:38px; margin-top:11px; padding:9px 11px; border-radius:8px; color:#a9c1df; background:#081426; font-size:12px }.status.error { color:var(--danger) }.status.warning { color:var(--warning) }
-.mapping-panel { margin-top:13px }.mapping-panel textarea { min-height:225px; resize:vertical; font:12px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace }
+.mapping-panel { margin:0; padding:0; overflow:hidden }.mapping-panel textarea { min-height:225px; resize:vertical; font:12px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace }
+.mapping-summary { display:flex; align-items:center; gap:12px; padding:15px; cursor:pointer; list-style:none }
+.mapping-summary::-webkit-details-marker { display:none }
+.mapping-summary::before { content:"›"; color:#7899c5; font-size:20px; line-height:14px; transition:transform .15s ease }
+.mapping-panel[open]>.mapping-summary::before { transform:rotate(90deg) }
+.mapping-summary strong { color:#f0f3fa; font-size:15px }
+.mapping-summary small { margin-left:auto; color:var(--muted) }
+.mapping-content { padding:0 15px 15px; border-top:1px solid var(--line) }
 .badge-list { display:flex; flex-wrap:wrap; gap:7px; margin:10px 0 }.badge { padding:6px 9px; border-left:4px solid var(--label-color); border-radius:5px; color:#cbdcf2; background:#081426; font-size:12px }
-@media(max-width:980px) { .studio { grid-template-columns:1fr }.results-panel { position:static; grid-row:1 } }
+.source-class-list { margin-top:12px; border:1px solid #243955; border-radius:8px; background:#081426 }
+.source-class-list>summary { padding:10px 12px; color:#c7d6ea; cursor:pointer; font-size:12px; font-weight:700 }
+.source-class-list>summary span { float:right; color:var(--muted); font-weight:500 }
+.source-class-table { max-height:320px; overflow:auto; border-top:1px solid #243955 }
+.source-class-heading,.source-class-entry { display:grid; grid-template-columns:minmax(105px,.42fr) minmax(180px,1fr); gap:12px; padding:7px 11px }
+.source-class-heading { position:sticky; top:0; z-index:1; color:#8096b3; background:#0d1c30; font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.09em }
+.source-class-entry { border-top:1px solid rgba(36,57,85,.55); color:#c5d2e4; font-size:11px }
+.source-class-entry code { color:#7899c5; font-family:ui-monospace,SFMono-Regular,Consolas,monospace }
+@media(max-width:980px) { .studio { grid-template-columns:1fr }.right-column { position:static; grid-row:1 } }
 @media(max-width:700px) { .topbar { padding:0 14px }.brand span { display:none } main { padding:14px 12px 30px }.triggered-card strong { font-size:19px }.controls-grid { grid-template-columns:1fr } video,.video-shell { min-height:210px } }

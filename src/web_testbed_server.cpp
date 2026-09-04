@@ -600,6 +600,7 @@ public:
             {
                 std::lock_guard<std::mutex> lock(clientMutex_);
                 ++activeClients_;
+                clientFds_.insert(client);
             }
             std::thread([this, client] {
                 try { handleClient(client); }
@@ -609,6 +610,7 @@ public:
                 ::close(client);
                 {
                     std::lock_guard<std::mutex> lock(clientMutex_);
+                    clientFds_.erase(client);
                     --activeClients_;
                 }
                 clientCondition_.notify_all();
@@ -620,6 +622,13 @@ public:
         // /api/events requests so shutdown does not wait for their 20-second
         // timeout before joining the active client threads.
         events_.wakeAll();
+        {
+            std::lock_guard<std::mutex> lock(clientMutex_);
+            // Firefox may keep media range requests open. Interrupt all active
+            // reads and writes; each client thread remains responsible for
+            // closing its own descriptor.
+            for (const int client : clientFds_) ::shutdown(client, SHUT_RDWR);
+        }
         std::unique_lock<std::mutex> clientLock(clientMutex_);
         clientCondition_.wait(clientLock, [this] { return activeClients_ == 0; });
         clientLock.unlock();
@@ -744,6 +753,7 @@ private:
     std::mutex clientMutex_;
     std::condition_variable clientCondition_;
     std::size_t activeClients_ = 0;
+    std::unordered_set<int> clientFds_;
 };
 
 void printUsage(const char* executable) {

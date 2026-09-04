@@ -40,6 +40,7 @@ if(BUILD_SVELTE_UI)
             ${CMAKE_CURRENT_SOURCE_DIR}/src/webui/svelte.config.js
             ${CMAKE_CURRENT_SOURCE_DIR}/src/webui/vite.config.ts
             ${CMAKE_CURRENT_SOURCE_DIR}/src/webui/tsconfig.json
+            ${CMAKE_CURRENT_SOURCE_DIR}/mid_to_display_name.tsv
         )
         set(SED_WEB_UI_OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/src/webui/dist/index.html)
         add_custom_command(
