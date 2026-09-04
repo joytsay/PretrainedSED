@@ -158,9 +158,16 @@
   }
 
   async function api(path: string, options?: RequestInit): Promise<Response> {
-    const response = await fetch(path, options);
+    let response: Response;
+    try {
+      response = await fetch(path, options);
+    } catch (error) {
+      console.error('[SED] request failed', path, error);
+      throw error;
+    }
     if (!response.ok) {
       const body = await response.text();
+      console.error('[SED] HTTP error', response.status, path, body);
       try { throw new Error(JSON.parse(body).error ?? body); }
       catch (error) {
         if (error instanceof SyntaxError) throw new Error(body || `HTTP ${response.status}`);
@@ -522,6 +529,11 @@
     while (!stopped) {
       try {
         const payload = await (await api(`/api/events?after=${eventSequence}`)).json();
+        console.debug('[SED] events poll', {
+          after: eventSequence,
+          next: payload.next,
+          count: payload.events?.length ?? 0
+        });
         connected = true;
         // The server periodically compacts its bounded event log and resets
         // its sequence.  Restart from zero so we receive the worker's ready
@@ -533,6 +545,7 @@
         eventSequence = payload.next ?? eventSequence;
         for (const envelope of payload.events ?? []) handleWorkerEvent(envelope.data as WorkerEvent);
       } catch (error) {
+        console.error('[SED] event polling failed', error);
         connected = false;
         if (!stopped) {
           status = `Server connection lost: ${error instanceof Error ? error.message : String(error)}`;
@@ -544,6 +557,7 @@
   }
 
   function handleWorkerEvent(event: WorkerEvent): void {
+    if (event.event !== 'result') console.info('[SED] worker event', event);
     if (event.event === 'ready') {
       classes = event.classes ?? [];
       scores = classes.map(() => 0);
