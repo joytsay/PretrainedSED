@@ -21,6 +21,12 @@ main { max-width:1500px; min-width:0; margin:auto; padding:22px }
 .triggered-events.active { border-color:#64303b; background:linear-gradient(110deg,rgba(76,22,34,.72),rgba(28,19,37,.88)) }
 .triggered-heading { color:#9eb5d2; font-size:10px; text-transform:uppercase; letter-spacing:.13em }
 .triggered-events.active .triggered-heading { color:#d69aa5 }
+.media-files-panel { margin-top:13px; border:1px solid var(--line); border-radius:9px; background:#0b1728 }
+.media-files-panel summary { cursor:pointer; padding:12px 14px; color:#dce6f7; font-size:13px; font-weight:800; list-style:none }
+.media-files-panel summary::-webkit-details-marker { display:none }
+.media-files-panel summary::before { content:'›'; display:inline-block; margin-right:9px; color:#8da8d1; font-size:18px; line-height:10px; transform:translateY(1px) }
+.media-files-panel[open] summary::before { transform:rotate(90deg) translateX(-1px) }
+.media-files-content { padding:0 14px 14px }
 .no-triggered-events { align-self:center; color:#e7edf7; font-size:22px; line-height:28px }
 .triggered-card { min-width:0; display:grid; grid-template-columns:38px minmax(0,1fr); align-items:center; color:var(--label-color) }
 .triggered-card svg { color:var(--label-color); filter:drop-shadow(0 0 7px color-mix(in srgb,var(--label-color) 38%,transparent)) }

@@ -39,6 +39,7 @@
   let scores: number[] = [];
   let thresholdPercent = 10;
   let camId = 'camera-01';
+  let tabCameraId = '';
   let mappingText = '';
   let connected = false;
   let workerReady = false;
@@ -56,6 +57,7 @@
   let stopped = false;
   let seekWasPlaying = false;
   let suppressSeekRestart = false;
+  let resumeAfterWorkerRestart = false;
   let realtimeContext: AudioContext | null = null;
   let realtimeSource: MediaElementAudioSourceNode | null = null;
   let realtimeProcessor: ScriptProcessorNode | null = null;
@@ -362,6 +364,22 @@
     return Date.now() * 1000 + requestCounter;
   }
 
+  async function registerTabCamera(): Promise<void> {
+    try {
+      const response = await api('/api/session');
+      const payload = await response.json() as { camera_id?: string };
+      tabCameraId = payload.camera_id ?? 'cam-01';
+      camId = tabCameraId;
+    } catch {
+      tabCameraId = 'cam-01';
+      camId = tabCameraId;
+    }
+  }
+
+  function unregisterTabCamera(): void {
+    // Camera IDs are server-assigned monotonic IDs and intentionally are not reused.
+  }
+
   async function setupRealtimeAudio(): Promise<AudioContext> {
     const AudioContextConstructor = window.AudioContext ?? window.webkitAudioContext;
     if (!AudioContextConstructor) throw new Error('This browser does not provide Web Audio');
@@ -491,12 +509,10 @@
 
   async function handleNativePlay(): Promise<void> {
     if (streamId !== null) {
-      // Resume the stream at the media timeline instead of sending packets
-      // accumulated while the element was paused.
+      // Resume the existing stream. Its packet clock must remain contiguous;
+      // seeking is handled separately by handleSeeked(), which starts a new
+      // stream with a fresh timestamp.
       realtimeSamples = [];
-      nextPacketTimestamp = Math.max(
-        0, Math.floor(video.currentTime * 1000 / PACKET_MS) * PACKET_MS
-      );
       return;
     }
     if (decoding) return;
@@ -564,9 +580,16 @@
       workerReady = classes.length > 0;
       status = `TensorRT worker ready · ${classes.length} aggregate classes`;
       statusKind = '';
+      if (resumeAfterWorkerRestart) {
+        resumeAfterWorkerRestart = false;
+        void startAnalysis(video.currentTime, true).catch(showError);
+      }
       return;
     }
     if (event.event === 'worker_restarting') {
+      resumeAfterWorkerRestart ||= Boolean(video && !video.paused);
+      streamId = null;
+      realtimeSamples = [];
       workerReady = false;
       status = 'Restarting worker with saved mapping…';
       return;
@@ -574,11 +597,18 @@
     if (event.event === 'worker_sleeping') {
       // Sleeping is an intentional low-power state. Keep the last class
       // mapping usable: the next /api/message request starts the worker again.
+      streamId = null;
+      realtimeSamples = [];
       status = event.message ?? 'Worker sleeping; it will wake on demand';
       statusKind = 'warning';
       return;
     }
     if (event.event === 'fatal' || event.event === 'server_error') {
+      if (event.message?.includes('restarting')) {
+        resumeAfterWorkerRestart ||= Boolean(video && !video.paused);
+        streamId = null;
+        realtimeSamples = [];
+      }
       workerReady = false;
       status = event.message ?? 'Worker failed';
       statusKind = 'error';
@@ -593,7 +623,7 @@
       scores = [...event.scores];
       const timestamp = event.timestamp_ms ?? 0;
       const lag = Math.max(0, Math.round(video.currentTime * 1000) - timestamp);
-      const cameraLabel = event.id !== undefined ? `camera-${event.id}` : event.cam_id ?? 'camera';
+      const cameraLabel = event.id !== undefined ? `stream-${event.id}` : event.cam_id ?? 'stream';
       status = `${cameraLabel} · ${timestamp} ms · inference ${event.processing_ms ?? 0} ms · playback lag ${lag} ms · superseded ${event.superseded_packets ?? 0}`;
       statusKind = lag > 200 ? 'warning' : '';
       if (pendingAutoPlay) {
@@ -614,6 +644,7 @@
   }
 
   onMount(() => {
+    registerTabCamera();
     void loadMapping();
     void loadDefaultVideos();
     void pollEvents();
@@ -621,6 +652,7 @@
   });
 
   onDestroy(() => {
+    unregisterTabCamera();
     stopped = true;
     if (pumpTimer !== undefined) window.clearInterval(pumpTimer);
     for (const item of playlist) {
@@ -658,12 +690,17 @@
           <label>Alert threshold <span>{thresholdPercent.toFixed(1)}%</span><input type="range" min="0" max="100" step="0.5" bind:value={thresholdPercent} /></label>
           <label>Packet cadence<input value="40 ms" disabled /></label>
         </div>
-        <div class="buttons">
-          <input bind:this={fileInput} class="file-native" type="file" multiple accept="video/*,audio/*" onchange={addFiles} />
-          <button class="primary" onclick={() => fileInput.click()}>Add media files</button>
-          <button onclick={() => void runCurrent()} disabled={!currentItem || !workerReady || decoding}>Run current</button>
-          <button class="danger" onclick={() => void clearPlaylist()} disabled={!playlist.length}>Clear</button>
-        </div>
+        <details class="media-files-panel">
+          <summary>Media Files</summary>
+          <div class="media-files-content">
+            <div class="buttons">
+              <input bind:this={fileInput} class="file-native" type="file" multiple accept="video/*,audio/*" onchange={addFiles} />
+              <button class="primary" onclick={() => fileInput.click()}>Add media files</button>
+              <button onclick={() => void runCurrent()} disabled={!currentItem || !workerReady || decoding}>Run current</button>
+              <button class="danger" onclick={() => void clearPlaylist()} disabled={!playlist.length}>Clear</button>
+            </div>
+          </div>
+        </details>
         {#if playlist.length}
           <ol class="playlist">
             {#each playlist as item, index}

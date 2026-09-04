@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -23,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -44,6 +46,8 @@ constexpr std::size_t kMaxHeaderBytes = 64 * 1024;
 constexpr std::size_t kMaxBodyBytes = 4 * 1024 * 1024;
 constexpr std::size_t kMaxEvents = 4096;
 constexpr auto kWorkerIdleTimeout = std::chrono::minutes(5);
+constexpr auto kWorkerWriteTimeout = std::chrono::seconds(2);
+constexpr auto kWorkerResponseTimeout = std::chrono::seconds(10);
 
 std::int64_t steadyNowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -220,20 +224,35 @@ public:
         const std::string line = message.dump() + "\n";
         std::lock_guard<std::mutex> lock(writeMutex_);
         if (inputFd_ < 0) throw std::runtime_error("Callback worker is not running");
+        const auto deadline = std::chrono::steady_clock::now() + kWorkerWriteTimeout;
         std::size_t offset = 0;
         while (offset < line.size()) {
             const ssize_t count = ::write(inputFd_, line.data() + offset, line.size() - offset);
             if (count < 0) {
                 if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now()).count();
+                    if (remaining <= 0) {
+                        throw std::runtime_error("Callback worker stopped accepting messages");
+                    }
+                    pollfd descriptor{inputFd_, POLLOUT, 0};
+                    const int result = ::poll(&descriptor, 1, static_cast<int>(remaining));
+                    if (result > 0) continue;
+                    if (result < 0 && errno == EINTR) continue;
+                    throw std::runtime_error("Callback worker write timed out");
+                }
                 throw std::runtime_error("Could not write to callback worker: " +
                                          std::string(std::strerror(errno)));
             }
+            if (count == 0) throw std::runtime_error("Callback worker pipe closed");
             offset += static_cast<std::size_t>(count);
         }
     }
 
     bool running() const { return pid_.load() > 0; }
     bool ready() const { return ready_.load(); }
+    std::int64_t lastCallbackMs() const { return lastCallbackMs_.load(); }
 
 private:
     void startLocked() {
@@ -263,10 +282,13 @@ private:
         ::close(outputPipe[1]);
         ::close(errorPipe[1]);
         inputFd_ = inputPipe[1];
+        const int flags = ::fcntl(inputFd_, F_GETFL, 0);
+        if (flags >= 0) ::fcntl(inputFd_, F_SETFL, flags | O_NONBLOCK);
         outputFd_ = outputPipe[0];
         errorFd_ = errorPipe[0];
         pid_ = child;
         ready_ = false;
+        lastCallbackMs_ = steadyNowMs();
         outputThread_ = std::thread([this] { readOutput(); });
         errorThread_ = std::thread([this] { readErrors(); });
     }
@@ -280,12 +302,21 @@ private:
         }
         if (child > 0) {
             int status = 0;
-            for (int attempt = 0; attempt < 20; ++attempt) {
-                if (::waitpid(child, &status, WNOHANG) == child) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(25));
-            }
-            if (::waitpid(child, &status, WNOHANG) == 0) {
+            const auto waitForExit = [&](std::chrono::milliseconds timeout) {
+                const auto deadline = std::chrono::steady_clock::now() + timeout;
+                while (std::chrono::steady_clock::now() < deadline) {
+                    const pid_t result = ::waitpid(child, &status, WNOHANG);
+                    if (result == child || (result < 0 && errno == ECHILD)) return true;
+                    if (result < 0 && errno != EINTR) return true;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                }
+                return false;
+            };
+            if (!waitForExit(std::chrono::milliseconds(500))) {
                 ::kill(child, SIGTERM);
+            }
+            if (!waitForExit(std::chrono::seconds(1))) {
+                ::kill(child, SIGKILL);
                 ::waitpid(child, &status, 0);
             }
         }
@@ -302,6 +333,7 @@ private:
         char* line = nullptr;
         std::size_t capacity = 0;
         while (::getline(&line, &capacity, stream) >= 0) {
+            lastCallbackMs_ = steadyNowMs();
             try {
                 json callback = json::parse(line);
                 if (callback.value("event", "") == "ready") ready_ = true;
@@ -337,6 +369,7 @@ private:
     EventLog& events_;
     std::atomic<pid_t> pid_{-1};
     std::atomic<bool> ready_{false};
+    std::atomic<std::int64_t> lastCallbackMs_{0};
     int inputFd_ = -1;
     int outputFd_ = -1;
     int errorFd_ = -1;
@@ -644,12 +677,15 @@ public:
             // closing its own descriptor.
             for (const int client : clientFds_) ::shutdown(client, SHUT_RDWR);
         }
+        idleStopping_ = true;
+        idleCondition_.notify_all();
+        if (idleThread_.joinable()) idleThread_.join();
+        // Stop the worker before waiting for request threads. This closes its
+        // input pipe and releases requests that were sending audio.
+        worker_.stop();
         std::unique_lock<std::mutex> clientLock(clientMutex_);
         clientCondition_.wait(clientLock, [this] { return activeClients_ == 0; });
         clientLock.unlock();
-        idleStopping_ = true;
-        if (idleThread_.joinable()) idleThread_.join();
-        worker_.stop();
     }
 
 private:
@@ -660,6 +696,11 @@ private:
         const std::string path = pathOnly(request.target);
         if (request.method == "OPTIONS") {
             respond(fd, 204, "text/plain", {});
+        } else if (path == "/api/session" && request.method == "GET") {
+            const auto number = nextCameraId_.fetch_add(1);
+            std::ostringstream camera;
+            camera << "cam-" << std::setw(2) << std::setfill('0') << number;
+            respond(fd, 200, "application/json", json({{"camera_id", camera.str()}}).dump());
         } else if (path == "/api/health" && request.method == "GET") {
             respond(fd, 200, "application/json",
                     json({{"ok", true}, {"worker_running", worker_.running()},
@@ -675,7 +716,15 @@ private:
             if (!message.is_object()) throw std::runtime_error("Message must be a JSON object");
             lastWorkerUseMs_ = steadyNowMs();
             if (!worker_.running()) worker_.start();
-            worker_.send(message);
+            try {
+                worker_.send(message);
+            } catch (const std::exception& error) {
+                events_.push({{"event", "server_error"},
+                              {"message", std::string("Worker communication failed: ") +
+                                              error.what() + "; restarting worker"}});
+                worker_.restart();
+                throw;
+            }
             respond(fd, 200, "application/json", "{\"ok\":true}");
         } else if (path == "/api/mapping" && request.method == "GET") {
             respond(fd, 200, "text/csv; charset=utf-8", readTextFile(config_.worker.mapping));
@@ -706,16 +755,31 @@ private:
     }
 
     void monitorWorkerIdle() {
+        std::unique_lock<std::mutex> idleLock(idleMutex_);
         while (!idleStopping_) {
-            std::this_thread::sleep_for(std::chrono::seconds(10));
+            idleCondition_.wait_for(idleLock, std::chrono::seconds(10),
+                                    [this] { return idleStopping_.load(); });
             if (idleStopping_) break;
-            if (worker_.running() && steadyNowMs() - lastWorkerUseMs_.load() >
+            idleLock.unlock();
+            const auto now = steadyNowMs();
+            const auto responseTimeoutMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    kWorkerResponseTimeout).count();
+            const bool receivingMessages = now - lastWorkerUseMs_.load() < responseTimeoutMs;
+            if (worker_.running() && worker_.ready() && receivingMessages &&
+                now - worker_.lastCallbackMs() > responseTimeoutMs) {
+                events_.push({{"event", "server_error"},
+                              {"message", "TensorRT worker produced no callback for 10 seconds; restarting"}});
+                worker_.restart();
+                lastWorkerUseMs_ = now;
+            } else if (worker_.running() && now - lastWorkerUseMs_.load() >
                                       std::chrono::duration_cast<std::chrono::milliseconds>(
                                           kWorkerIdleTimeout).count()) {
                 worker_.stop();
                 events_.push({{"event", "worker_sleeping"},
                               {"message", "Worker stopped after idle timeout"}});
             }
+            idleLock.lock();
         }
     }
 
@@ -787,8 +851,11 @@ private:
     std::condition_variable clientCondition_;
     std::size_t activeClients_ = 0;
     std::unordered_set<int> clientFds_;
+    std::atomic<std::uint64_t> nextCameraId_{1};
     std::atomic<bool> idleStopping_{false};
     std::atomic<std::int64_t> lastWorkerUseMs_{0};
+    std::mutex idleMutex_;
+    std::condition_variable idleCondition_;
     std::thread idleThread_;
 };
 
