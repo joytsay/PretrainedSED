@@ -621,7 +621,7 @@
 <svelte:head><meta name="description" content="Browser testbed for the ATST-F TensorRT sound event detector" /></svelte:head>
 
 <header class="topbar">
-  <div class="brand"><div class="mark">G</div><div><strong>GeoVision SED</strong><span>Sound Event Detection</span></div></div>
+  <div class="brand"><img class="mark" src="/logo_cloud.svg" alt="" aria-hidden="true" /><div><strong>GeoVision SED</strong><span>Sound Event Detection</span></div></div>
   <div class:online={connected && workerReady} class="connection">
     {connected ? (workerReady ? 'Worker ready' : 'Server connected') : 'Offline'}
   </div>
