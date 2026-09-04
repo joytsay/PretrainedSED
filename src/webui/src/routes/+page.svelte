@@ -593,7 +593,8 @@
       scores = [...event.scores];
       const timestamp = event.timestamp_ms ?? 0;
       const lag = Math.max(0, Math.round(video.currentTime * 1000) - timestamp);
-      status = `${event.cam_id} · ${timestamp} ms · inference ${event.processing_ms ?? 0} ms · playback lag ${lag} ms · superseded ${event.superseded_packets ?? 0}`;
+      const cameraLabel = event.id !== undefined ? `camera-${event.id}` : event.cam_id ?? 'camera';
+      status = `${cameraLabel} · ${timestamp} ms · inference ${event.processing_ms ?? 0} ms · playback lag ${lag} ms · superseded ${event.superseded_packets ?? 0}`;
       statusKind = lag > 200 ? 'warning' : '';
       if (pendingAutoPlay) {
         pendingAutoPlay = false;
