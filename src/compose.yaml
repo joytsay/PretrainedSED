@@ -1,0 +1,30 @@
+services:
+  sed:
+    image: ${PSED_IMAGE:-psed:latest}
+    container_name: ${PSED_CONTAINER_NAME:-psed}
+    restart: unless-stopped
+    init: true
+    runtime: nvidia
+    ipc: host
+    working_dir: /workspace
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ports:
+      - "${PSED_PORT:-8080}:8080"
+    volumes:
+      - ..:/workspace
+    command:
+      - bash
+      - -lc
+      - |
+        export LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/nvidia:/usr/lib/aarch64-linux-gnu/tegra:$${LD_LIBRARY_PATH:-}"
+        exec /workspace/build-agx/atst_sed_web_testbed \
+          --worker /workspace/build-agx/atst_sed_worker \
+          --engine /workspace/resources/ATST-F_strong_1.trt \
+          --mapping /workspace/class_mapping.csv \
+          --labels /workspace/resources/ATST-F_strong_1.labels.txt \
+          --web-root /workspace/src/webui/dist \
+          --videos-root /workspace/videos \
+          --host 0.0.0.0 \
+          --port 8080
