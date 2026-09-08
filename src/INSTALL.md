@@ -35,6 +35,18 @@ docker build --no-cache --pull \
   -t psed:latest \
   .
 
+docker run --rm -it \
+  --name psed \
+  --runtime nvidia \
+  --ipc=host \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  -p 8080:8080 \
+  -v /home/nvidia/joy/PretrainedSED:/workspace \
+  -w /workspace \
+  psed:latest \
+  bash
+
 On the AGX container, convert the public checkpoint to ONNX and TensorRT FP16:
 
 ```sh
@@ -76,8 +88,11 @@ build runs `npm ci` if `src/webui/node_modules` is not present.
 
 ```sh
 cmake -S /workspace -B /workspace/build-agx \
-  -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build /workspace/build-agx -j4
+  -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_QT_TESTBED=OFF \
+  -DBUILD_SVELTE_UI=ON
+cmake --build /workspace/build-agx \
+  --target atst_sed_web_testbed atst_sed_worker -j4
 ```
 
 ## Run the testbed

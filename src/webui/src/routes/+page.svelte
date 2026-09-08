@@ -63,6 +63,7 @@
   let realtimeProcessor: ScriptProcessorNode | null = null;
   let realtimeSamples: number[] = [];
   let realtimePacketChain = Promise.resolve();
+  let workerWakeInFlight = false;
 
   $: currentItem = currentIndex >= 0 ? playlist[currentIndex] : null;
   $: orderedScores = classes
@@ -359,6 +360,35 @@
     });
   }
 
+  async function wakeWorkerIfStopped(): Promise<void> {
+    if (workerWakeInFlight) return;
+    workerWakeInFlight = true;
+    try {
+      const health = await (await api('/api/health')).json() as {
+        worker_running?: boolean;
+        worker_ready?: boolean;
+      };
+      if (health.worker_running) return;
+
+      workerReady = false;
+      status = 'Waking TensorRT worker…';
+      statusKind = 'warning';
+      const id = newStreamId();
+      const wakeCamId = 'watchdog';
+      await sendMessage({
+        type: 'stream_start', id, cam_id: wakeCamId, timestamp_ms: 0
+      });
+      // Close the synthetic stream after it has served its only purpose. Both
+      // messages remain queued while TensorRT initializes, so this does not
+      // leave an unused stream allocated in the worker.
+      await sendMessage({
+        type: 'stream_end', id, cam_id: wakeCamId, timestamp_ms: 0
+      });
+    } finally {
+      workerWakeInFlight = false;
+    }
+  }
+
   function newStreamId(): number {
     requestCounter = (requestCounter + 1) % 1000;
     return Date.now() * 1000 + requestCounter;
@@ -595,12 +625,15 @@
       return;
     }
     if (event.event === 'worker_sleeping') {
-      // Sleeping is an intentional low-power state. Keep the last class
-      // mapping usable: the next /api/message request starts the worker again.
+      // A message to a stopped worker starts it on demand. Wake it immediately
+      // while this browser is connected, using the same stream_start request
+      // that can be sent manually with curl.
       streamId = null;
       realtimeSamples = [];
-      status = event.message ?? 'Worker sleeping; it will wake on demand';
+      workerReady = false;
+      status = event.message ?? 'Worker sleeping; waking it now…';
       statusKind = 'warning';
+      void wakeWorkerIfStopped().catch(showError);
       return;
     }
     if (event.event === 'fatal' || event.event === 'server_error') {
@@ -644,7 +677,7 @@
   }
 
   onMount(() => {
-    registerTabCamera();
+    void registerTabCamera().then(() => wakeWorkerIfStopped()).catch(showError);
     void loadMapping();
     void loadDefaultVideos();
     void pollEvents();
