@@ -8,9 +8,13 @@ button,input,textarea { font:inherit } button { color:inherit }
 .brand .mark { width:34px; height:34px; display:block; flex:0 0 34px }
 .brand strong { display:block; color:#edf3ff; font-size:15px; letter-spacing:-.02em }
 .brand span { display:block; margin-top:2px; color:#819ce7; font-size:10px; text-transform:uppercase; letter-spacing:.12em }
-.connection { width:max-content; margin-left:auto; color:#687892; font-size:11px }
+.connection { width:max-content; margin-left:auto; padding:0; border:0; color:#687892; background:none; font-size:11px }
 .connection::before { content:""; display:inline-block; width:6px; height:6px; margin-right:6px; border-radius:50%; background:#64748b }
 .connection.online::before { background:#61dc93; box-shadow:0 0 9px #61dc93 }
+.connection:disabled { opacity:1 }
+.connection.actionable { color:var(--warning); cursor:pointer }
+.connection.actionable:hover { color:#ffe0ad }
+.connection.actionable:focus-visible { outline:2px solid var(--warning); outline-offset:5px; border-radius:2px }
 main { max-width:1500px; min-width:0; margin:auto; padding:22px }
 .right-column { min-width:0; display:grid; gap:13px; align-content:start; position:sticky; top:75px }
 .results-panel { min-width:0; padding:15px; border:1px solid var(--line); border-radius:10px; background:#0b1728 }

@@ -368,7 +368,19 @@
         worker_running?: boolean;
         worker_ready?: boolean;
       };
-      if (health.worker_running) return;
+      if (health.worker_ready) {
+        workerReady = classes.length > 0;
+        status = workerReady
+          ? `TensorRT worker ready · ${classes.length} aggregate classes`
+          : 'TensorRT worker ready; synchronizing classes…';
+        statusKind = '';
+        return;
+      }
+      if (health.worker_running) {
+        status = 'TensorRT worker is starting…';
+        statusKind = 'warning';
+        return;
+      }
 
       workerReady = false;
       status = 'Waking TensorRT worker…';
@@ -575,11 +587,6 @@
     while (!stopped) {
       try {
         const payload = await (await api(`/api/events?after=${eventSequence}`)).json();
-        console.debug('[SED] events poll', {
-          after: eventSequence,
-          next: payload.next,
-          count: payload.events?.length ?? 0
-        });
         connected = true;
         // The server periodically compacts its bounded event log and resets
         // its sequence.  Restart from zero so we receive the worker's ready
@@ -625,15 +632,14 @@
       return;
     }
     if (event.event === 'worker_sleeping') {
-      // A message to a stopped worker starts it on demand. Wake it immediately
-      // while this browser is connected, using the same stream_start request
-      // that can be sent manually with curl.
+      // Leave an idle worker asleep until the user explicitly wakes it. This
+      // avoids repeatedly initializing TensorRT while an inactive tab remains
+      // open.
       streamId = null;
       realtimeSamples = [];
       workerReady = false;
-      status = event.message ?? 'Worker sleeping; waking it now…';
+      status = event.message ?? 'Worker sleeping; click Wake to restart it';
       statusKind = 'warning';
-      void wakeWorkerIfStopped().catch(showError);
       return;
     }
     if (event.event === 'fatal' || event.event === 'server_error') {
@@ -702,9 +708,12 @@
 
 <header class="topbar">
   <div class="brand"><img class="mark" src="/logo_cloud.svg" alt="" aria-hidden="true" /><div><strong>GeoVision SED</strong><span>Sound Event Detection</span></div></div>
-  <div class:online={connected && workerReady} class="connection">
-    {connected ? (workerReady ? 'Worker ready' : 'Server connected') : 'Offline'}
-  </div>
+  <button type="button" class="connection" class:online={connected && workerReady}
+    class:actionable={connected && !workerReady} disabled={!connected || workerReady || workerWakeInFlight}
+    title={connected && !workerReady ? 'Wake the TensorRT worker' : undefined}
+    onclick={() => void wakeWorkerIfStopped().catch(showError)}>
+    {workerWakeInFlight ? 'Waking worker…' : connected ? (workerReady ? 'Worker ready' : 'Worker stopped · Wake') : 'Offline'}
+  </button>
 </header>
 
 <main>
