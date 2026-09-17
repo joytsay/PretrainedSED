@@ -1,7 +1,28 @@
 services:
+  webui-build:
+    image: node:22-bookworm-slim
+    restart: "no"
+    working_dir: /workspace/src/webui
+    environment:
+      npm_config_cache: /tmp/npm-cache
+    volumes:
+      - ..:/workspace
+    command:
+      - sh
+      - -lc
+      - |
+        set -eu
+        npm ci
+        npm run build
+        owner="$$(stat -c '%u:%g' package.json)"
+        chown -R "$${owner}" node_modules .svelte-kit dist
+
   sed:
     image: ${PSED_IMAGE:-psed:latest}
     container_name: ${PSED_CONTAINER_NAME:-psed}
+    depends_on:
+      webui-build:
+        condition: service_completed_successfully
     restart: unless-stopped
     init: true
     runtime: nvidia

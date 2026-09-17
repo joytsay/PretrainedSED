@@ -82,6 +82,17 @@ npm run build
 The static build is written to `src/webui/dist`. During frontend development,
 `npm run dev` proxies `/api` to the C++ server on port 8080.
 
+The Compose setup builds the web UI in a temporary Node container before it
+starts the SED service. From the repository root, force recreation so the
+one-shot build container runs again after frontend changes:
+
+```sh
+docker compose -f src/compose.yaml up -d --build --force-recreate
+```
+
+The build container restores the generated directories to the repository
+owner, so it can also repair artifacts created by an earlier root-owned build.
+
 When `npm` is installed, the CMake target `atst_sed_web_testbed` also tracks
 the UI sources and rebuilds this static bundle automatically. The first such
 build runs `npm ci` if `src/webui/node_modules` is not present.
