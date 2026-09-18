@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import SoundIcon from '../components/SoundIcon.svelte';
-  import { computeMelColumn, FFT_SIZE, magmaColor, MEL_BANDS } from '../spectrogram';
   import '../app.css';
   import displayNamesText from '../../../../mid_to_display_name.tsv?raw';
 
@@ -63,11 +62,9 @@
   let realtimeSource: MediaElementAudioSourceNode | null = null;
   let realtimeProcessor: ScriptProcessorNode | null = null;
   let realtimeSamples: number[] = [];
-  let spectrogramSamples: number[] = [];
   let realtimePacketChain = Promise.resolve();
   let workerWakeInFlight = false;
-  let showSedVisualization = false;
-  let melCanvas: HTMLCanvasElement;
+  let showSedTimeline = false;
   let timelineCanvas: HTMLCanvasElement;
   let visualizationTimer: number | undefined;
 
@@ -132,35 +129,6 @@
     return { title, subtitle, color: colorFor(name), icon: 'audio' };
   }
 
-  function visualizationWindow(): { samples: Float32Array; sampleRate: number } | null {
-    if (audioBuffer && video) {
-      const output = new Float32Array(FFT_SIZE);
-      const sourceRate = audioBuffer.sampleRate;
-      const sourceEnd = video.currentTime * sourceRate;
-      const sourceStep = sourceRate / SAMPLE_RATE;
-      const sourceStart = sourceEnd - FFT_SIZE * sourceStep;
-      for (let index = 0; index < FFT_SIZE; index += 1) {
-        const position = sourceStart + index * sourceStep;
-        const left = Math.floor(position);
-        const fraction = position - left;
-        let value = 0;
-        for (let channel = 0; channel < audioBuffer.numberOfChannels; channel += 1) {
-          const data = audioBuffer.getChannelData(channel);
-          const first = left >= 0 && left < data.length ? data[left] : 0;
-          const second = left + 1 >= 0 && left + 1 < data.length ? data[left + 1] : first;
-          value += first + (second - first) * fraction;
-        }
-        output[index] = value / Math.max(1, audioBuffer.numberOfChannels);
-      }
-      return { samples: output, sampleRate: SAMPLE_RATE };
-    }
-    if (spectrogramSamples.length < FFT_SIZE) return null;
-    return {
-      samples: Float32Array.from(spectrogramSamples.slice(-FFT_SIZE)),
-      sampleRate: realtimeContext?.sampleRate ?? SAMPLE_RATE
-    };
-  }
-
   function shiftCanvas(context: CanvasRenderingContext2D, canvas: HTMLCanvasElement): number {
     const shift = Math.max(1, Math.round(
       canvas.width * VISUALIZATION_INTERVAL_MS / (VISUALIZATION_SECONDS * 1000)
@@ -170,15 +138,7 @@
     return shift;
   }
 
-  function resetSedVisualization(): void {
-    spectrogramSamples = [];
-    if (melCanvas) {
-      const context = melCanvas.getContext('2d');
-      if (context) {
-        context.fillStyle = '#000004';
-        context.fillRect(0, 0, melCanvas.width, melCanvas.height);
-      }
-    }
+  function resetSedTimeline(): void {
     if (timelineCanvas) {
       const context = timelineCanvas.getContext('2d');
       if (context) {
@@ -188,28 +148,11 @@
     }
   }
 
-  function drawSedVisualization(): void {
-    if (!showSedVisualization || !melCanvas || !timelineCanvas || !video || video.paused) return;
+  function drawSedTimeline(): void {
+    if (!showSedTimeline || !timelineCanvas || !video || video.paused) return;
 
-    const melContext = melCanvas.getContext('2d');
     const timelineContext = timelineCanvas.getContext('2d');
-    if (!melContext || !timelineContext) return;
-
-    const melWindow = visualizationWindow();
-    if (melWindow) {
-      const mel = computeMelColumn(melWindow.samples, melWindow.sampleRate);
-      const shift = shiftCanvas(melContext, melCanvas);
-      const bandHeight = melCanvas.height / MEL_BANDS;
-      for (let band = 0; band < MEL_BANDS; band += 1) {
-        melContext.fillStyle = magmaColor(mel[band]);
-        melContext.fillRect(
-          melCanvas.width - shift,
-          melCanvas.height - (band + 1) * bandHeight,
-          shift,
-          Math.ceil(bandHeight)
-        );
-      }
-    }
+    if (!timelineContext) return;
 
     const shift = shiftCanvas(timelineContext, timelineCanvas);
     const rowHeight = timelineCanvas.height / Math.max(1, classes.length);
@@ -217,16 +160,16 @@
       timelineContext.fillStyle = '#06101e';
       timelineContext.globalAlpha = 1;
       timelineContext.fillRect(timelineCanvas.width - shift, index * rowHeight, shift, Math.ceil(rowHeight));
-      timelineContext.fillStyle = colorFor(classes[index]);
-      timelineContext.globalAlpha = Math.max(0.04, Math.min(1, scores[index] ?? 0));
-      timelineContext.fillRect(timelineCanvas.width - shift, index * rowHeight, shift, Math.ceil(rowHeight));
+      if ((scores[index] ?? 0) * 100 > thresholdPercent) {
+        timelineContext.fillStyle = colorFor(classes[index]);
+        timelineContext.fillRect(timelineCanvas.width - shift, index * rowHeight, shift, Math.ceil(rowHeight));
+      }
     }
-    timelineContext.globalAlpha = 1;
   }
 
-  function toggleSedVisualization(event: Event): void {
-    showSedVisualization = (event.currentTarget as HTMLInputElement).checked;
-    if (showSedVisualization) requestAnimationFrame(resetSedVisualization);
+  function toggleSedTimeline(event: Event): void {
+    showSedTimeline = (event.currentTarget as HTMLInputElement).checked;
+    if (showSedTimeline) requestAnimationFrame(resetSedTimeline);
   }
 
   function parseCsvRow(line: string): string[] {
@@ -383,7 +326,7 @@
     await stopStream();
     currentIndex = index;
     audioBuffer = null;
-    resetSedVisualization();
+    resetSedTimeline();
     scores = classes.map(() => 0);
     status = `Selected ${playlist[index].name}`;
     statusKind = '';
@@ -558,10 +501,6 @@
         for (let index = 0; index < frames; index += 1) {
           const sample = channels > 1 ? (first[index] + second[index]) * 0.5 : first[index];
           realtimeSamples.push(sample);
-          if (showSedVisualization) spectrogramSamples.push(sample);
-        }
-        if (spectrogramSamples.length > FFT_SIZE * 2) {
-          spectrogramSamples.splice(0, spectrogramSamples.length - FFT_SIZE * 2);
         }
         const id = streamId;
         while (realtimeSamples.length >= PACKET_SAMPLES && streamId === id) {
@@ -588,7 +527,7 @@
     await stopStream();
     await setupRealtimeAudio();
     realtimeSamples = [];
-    resetSedVisualization();
+    resetSedTimeline();
     realtimePacketChain = Promise.resolve();
     streamId = newStreamId();
     nextPacketTimestamp = Math.max(0, Math.floor(positionSeconds * 1000 / PACKET_MS) * PACKET_MS);
@@ -609,7 +548,7 @@
     video.pause();
     await stopStream();
     const buffer = await decodeCurrent();
-    resetSedVisualization();
+    resetSedTimeline();
     const timestamp = Math.max(0, Math.floor(positionSeconds * 1000 / PACKET_MS) * PACKET_MS);
     streamId = newStreamId();
     nextPacketTimestamp = timestamp;
@@ -802,7 +741,7 @@
     void loadDefaultVideos();
     void pollEvents();
     pumpTimer = window.setInterval(() => void pumpPackets(), 20);
-    visualizationTimer = window.setInterval(drawSedVisualization, VISUALIZATION_INTERVAL_MS);
+    visualizationTimer = window.setInterval(drawSedTimeline, VISUALIZATION_INTERVAL_MS);
   });
 
   onDestroy(() => {
@@ -848,19 +787,15 @@
           <label>Alert threshold <span>{thresholdPercent.toFixed(1)}%</span><input type="range" min="0" max="100" step="0.5" bind:value={thresholdPercent} /></label>
           <label>Packet cadence<input value="40 ms" disabled /></label>
           <label class="visualization-toggle">
-            <input type="checkbox" checked={showSedVisualization} onchange={toggleSedVisualization} />
-            <span>Show SED spectrogram</span>
+            <input type="checkbox" checked={showSedTimeline} onchange={toggleSedTimeline} />
+            <span>Show SED timeline</span>
           </label>
         </div>
-        {#if showSedVisualization}
-          <section class="sed-visualization" aria-label="Live SED mel spectrogram and class timeline">
+        {#if showSedTimeline}
+          <section class="sed-visualization" aria-label="Live color-coded SED event timeline">
             <div class="visualization-head">
-              <strong>Live SED visualization</strong>
+              <strong>Live SED events</strong>
               <small>Rolling {VISUALIZATION_SECONDS} seconds</small>
-            </div>
-            <div class="mel-visualization">
-              <div class="frequency-axis" aria-hidden="true"><span>7.8 kHz</span><span>60 Hz</span></div>
-              <canvas bind:this={melCanvas} width="720" height="160" aria-label="Mel spectrogram"></canvas>
             </div>
             <div class="timeline-visualization">
               <div class="timeline-labels">
