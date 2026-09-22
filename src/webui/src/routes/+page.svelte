@@ -67,6 +67,7 @@
   let showSedTimeline = false;
   let timelineCanvas: HTMLCanvasElement;
   let visualizationTimer: number | undefined;
+  let playlistAdvancing = false;
 
   const VISUALIZATION_INTERVAL_MS = 100;
   const VISUALIZATION_SECONDS = 10;
@@ -630,10 +631,59 @@
   }
 
   async function handleEnded(): Promise<void> {
-    await stopStream();
-    if (!playlist.length) return;
-    await selectItem((currentIndex + 1) % playlist.length);
-    await startAnalysis(0, true);
+    await advancePlaylist();
+  }
+
+  function mediaErrorDescription(): string {
+    const error = video?.error;
+    if (!error) return 'unknown media error';
+    const descriptions: Record<number, string> = {
+      [MediaError.MEDIA_ERR_ABORTED]: 'loading was aborted',
+      [MediaError.MEDIA_ERR_NETWORK]: 'network loading failed',
+      [MediaError.MEDIA_ERR_DECODE]: 'the browser could not decode the media',
+      [MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED]: 'the URI or media format is unsupported'
+    };
+    return error.message || descriptions[error.code] || `media error ${error.code}`;
+  }
+
+  async function advancePlaylist(retryCurrent = false): Promise<void> {
+    if (playlistAdvancing || !playlist.length) return;
+    playlistAdvancing = true;
+    const failures: string[] = [];
+    const startIndex = currentIndex;
+    try {
+      await stopStream();
+      for (let attempt = 0; attempt < playlist.length; attempt += 1) {
+        const offset = attempt + (retryCurrent ? 0 : 1);
+        const index = (startIndex + offset) % playlist.length;
+        const item = playlist[index];
+        try {
+          await selectItem(index);
+          await startAnalysis(0, true);
+          return;
+        } catch (error) {
+          const reason = video?.error ? mediaErrorDescription() :
+            (error instanceof Error ? error.message : String(error));
+          console.error('[SED] skipping unplayable media', { name: item.name, url: item.url, reason });
+          failures.push(`${item.name}: ${reason}`);
+          await stopStream();
+        }
+      }
+      status = `No playable media remains: ${failures.join('; ')}`;
+      statusKind = 'error';
+    } finally {
+      playlistAdvancing = false;
+    }
+  }
+
+  async function handleMediaError(): Promise<void> {
+    if (!currentItem || playlistAdvancing) return;
+    const failed = currentItem;
+    const reason = mediaErrorDescription();
+    console.error('[SED] media playback failed', { name: failed.name, url: failed.url, reason });
+    status = `Could not play ${failed.name}: ${reason}; reloading it…`;
+    statusKind = 'warning';
+    await advancePlaylist(true);
   }
 
   async function pollEvents(): Promise<void> {
@@ -778,8 +828,9 @@
         <div class="panel-head"><h2>Media preview</h2><small>{currentItem?.name ?? 'No media selected'}</small></div>
         <div class="video-shell">
           <!-- svelte-ignore a11y_media_has_caption -->
-          <video bind:this={video} src={currentItem?.url ?? ''} controls playsinline
-            onplay={() => void handleNativePlay()} onseeking={handleSeeking} onseeked={() => void handleSeeked()} onended={() => void handleEnded()}></video>
+          <video bind:this={video} src={currentItem?.url} controls playsinline
+            onplay={() => void handleNativePlay()} onseeking={handleSeeking} onseeked={() => void handleSeeked()}
+            onended={() => void handleEnded()} onerror={() => void handleMediaError()}></video>
           {#if !currentItem}<div class="empty-video">Choose one or more video/audio files</div>{/if}
         </div>
         <div class="controls-grid">
