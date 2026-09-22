@@ -391,15 +391,31 @@ std::vector<float> makeMelFilter() {
     return filter;
 }
 
-std::vector<float> computeMel(const std::vector<float>& chunk) {
+struct MelFeatures {
+    std::vector<float> values;
+    float recentPeakDb = -100.0F;
+    float recentPeakHz = 0.0F;
+};
+
+float melBandCenterHz(int melBin) {
+    const float minMel = hzToMel(60.0F);
+    const float maxMel = hzToMel(7800.0F);
+    return melToHz(
+        minMel + (maxMel - minMel) * (melBin + 1) / (kMelBins + 1));
+}
+
+MelFeatures computeMel(const std::vector<float>& chunk) {
     constexpr int frequencyBins = kFftSize / 2 + 1;
     static const std::vector<float> filter = makeMelFilter();
     std::array<float, kFftSize> window{};
     for (int index = 0; index < kFftSize; ++index) {
         window[index] = 0.5F - 0.5F * std::cos(static_cast<float>(2.0 * kPi * index / kFftSize));
     }
-    std::vector<float> mel(kMelBins * kMelFrames, 0.0F);
+    MelFeatures features;
+    auto& mel = features.values;
+    mel.resize(kMelBins * kMelFrames, 0.0F);
     std::vector<std::complex<float>> spectrum(kFftSize);
+    constexpr int recentFrames = kPacketMilliseconds * kSampleRate / (1000 * kHopSize);
     for (int frame = 0; frame < kMelFrames; ++frame) {
         const int start = frame * kHopSize - kFftSize / 2;
         for (int index = 0; index < kFftSize; ++index) {
@@ -411,7 +427,12 @@ std::vector<float> computeMel(const std::vector<float>& chunk) {
             for (int frequency = 0; frequency < frequencyBins; ++frequency) {
                 power += std::norm(spectrum[frequency]) * filter[melBin * frequencyBins + frequency];
             }
-            mel[melBin * kMelFrames + frame] = 10.0F * std::log10(std::max(power, 1.0e-10F));
+            const float powerDb = 10.0F * std::log10(std::max(power, 1.0e-10F));
+            mel[melBin * kMelFrames + frame] = powerDb;
+            if (frame >= kMelFrames - recentFrames && powerDb > features.recentPeakDb) {
+                features.recentPeakDb = powerDb;
+                features.recentPeakHz = melBandCenterHz(melBin);
+            }
         }
     }
     const float maximum = *std::max_element(mel.begin(), mel.end());
@@ -420,7 +441,9 @@ std::vector<float> computeMel(const std::vector<float>& chunk) {
         value = std::clamp(value, -50.0F, 80.0F);
         value = (value - (-79.6482F)) / (50.6842F - (-79.6482F)) * 2.0F - 1.0F;
     }
-    return mel;
+    features.recentPeakDb = std::max(features.recentPeakDb, maximum - 80.0F);
+    features.recentPeakDb = std::clamp(features.recentPeakDb, -50.0F, 80.0F);
+    return features;
 }
 
 json aggregateFrame(
@@ -515,7 +538,8 @@ private:
             }
 
             const auto started = std::chrono::steady_clock::now();
-            const auto output = model_.infer(computeMel(job.window));
+            const auto mel = computeMel(job.window);
+            const auto output = model_.infer(mel.values);
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - started);
 
@@ -528,6 +552,8 @@ private:
                 {"window_end_ms", job.timestampMs + kPacketMilliseconds},
                 {"processing_ms", elapsed.count()},
                 {"superseded_packets", job.supersededPackets},
+                {"signal_db", mel.recentPeakDb},
+                {"signal_frequency_hz", mel.recentPeakHz},
                 {"scores", aggregateFrame(output, mapping_, kOutputFrames - 1)},
             };
             const std::lock_guard<std::mutex> lock(mutex_);

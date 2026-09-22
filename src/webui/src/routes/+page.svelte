@@ -11,6 +11,8 @@
     timestamp_ms?: number;
     processing_ms?: number;
     superseded_packets?: number;
+    signal_db?: number;
+    signal_frequency_hz?: number;
     scores?: number[];
     classes?: string[];
     message?: string;
@@ -37,6 +39,8 @@
   let currentIndex = -1;
   let classes: string[] = [];
   let scores: number[] = [];
+  let signalDb: number | null = null;
+  let signalFrequencyHz: number | null = null;
   let thresholdPercent = 10;
   let camId = 'camera-01';
   let tabCameraId = '';
@@ -128,6 +132,14 @@
     if (similar) return { ...similar, title, subtitle, color: colorFor(name) };
 
     return { title, subtitle, color: colorFor(name), icon: 'audio' };
+  }
+
+  function signalSummary(): string | null {
+    if (signalDb === null || signalFrequencyHz === null) return null;
+    const frequency = signalFrequencyHz >= 1000
+      ? `${(signalFrequencyHz / 1000).toFixed(1)} kHz`
+      : `${Math.round(signalFrequencyHz)} Hz`;
+    return `${Math.round(signalDb)} dB · ${frequency}`;
   }
 
   function shiftCanvas(context: CanvasRenderingContext2D, canvas: HTMLCanvasElement): number {
@@ -318,6 +330,8 @@
     currentIndex = -1;
     audioBuffer = null;
     scores = classes.map(() => 0);
+    signalDb = null;
+    signalFrequencyHz = null;
     status = 'Playlist cleared';
   }
 
@@ -329,6 +343,8 @@
     audioBuffer = null;
     resetSedTimeline();
     scores = classes.map(() => 0);
+    signalDb = null;
+    signalFrequencyHz = null;
     status = `Selected ${playlist[index].name}`;
     statusKind = '';
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
@@ -763,6 +779,10 @@
       statusKind = 'error';
     } else if (event.event === 'result' && event.scores?.length === classes.length) {
       scores = [...event.scores];
+      signalDb = typeof event.signal_db === 'number' ? event.signal_db : null;
+      signalFrequencyHz = typeof event.signal_frequency_hz === 'number'
+        ? event.signal_frequency_hz
+        : null;
       const timestamp = event.timestamp_ms ?? 0;
       const lag = Math.max(0, Math.round(video.currentTime * 1000) - timestamp);
       const cameraLabel = event.id !== undefined ? `stream-${event.id}` : event.cam_id ?? 'stream';
@@ -850,9 +870,15 @@
             </div>
             <div class="timeline-visualization">
               <div class="timeline-labels">
-                {#each classes as name}
+                {#each classes as name, index}
                   {@const category = categoryFor(name)}
-                  <span style={`--label-color:${category.color}`} title={name}>{category.title}</span>
+                  {@const signal = signalSummary()}
+                  <span style={`--label-color:${category.color}`} title={name}>
+                    <b>{category.title}</b>
+                    {#if (scores[index] ?? 0) * 100 > thresholdPercent && signal}
+                      <small>{signal}</small>
+                    {/if}
+                  </span>
                 {/each}
               </div>
               <canvas bind:this={timelineCanvas} width="720" height={Math.max(1, classes.length) * 24}
@@ -891,11 +917,14 @@
         {#if triggeredScores.length}
           {#each triggeredScores as item (item.index)}
             {@const category = categoryFor(item.name)}
+            {@const signal = signalSummary()}
             <div class="triggered-card" style={`--label-color:${category.color}`}>
               <SoundIcon kind={category.icon} size={31} strokeWidth={1.9} />
               <div class="triggered-copy">
                 <strong><b>{category.title}</b><b>{(item.score * 100).toFixed(1)}%</b></strong>
+                {#if signal}<span class="triggered-signal">{signal}</span>{/if}
                 <span>{category.subtitle}</span>
+                <div class="bar triggered-confidence" style={`--score:${Math.min(100, item.score * 100)}%`}><i></i></div>
               </div>
             </div>
           {/each}
