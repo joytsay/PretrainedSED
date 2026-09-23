@@ -45,7 +45,6 @@ namespace fs = std::filesystem;
 constexpr std::size_t kMaxHeaderBytes = 64 * 1024;
 constexpr std::size_t kMaxBodyBytes = 4 * 1024 * 1024;
 constexpr std::size_t kMaxEvents = 4096;
-constexpr auto kWorkerIdleTimeout = std::chrono::minutes(5);
 constexpr auto kWorkerWriteTimeout = std::chrono::seconds(2);
 constexpr auto kWorkerResponseTimeout = std::chrono::seconds(10);
 
@@ -634,8 +633,7 @@ public:
                                      std::to_string(config_.port) + ": " + message);
         }
         gListenFd = server;
-        lastWorkerUseMs_ = steadyNowMs();
-        idleThread_ = std::thread([this] { monitorWorkerIdle(); });
+        watchdogThread_ = std::thread([this] { monitorWorkerResponse(); });
         std::cout << "GeoVision SED web testbed listening on http://" << config_.host << ':'
                   << config_.port << '\n';
         while (gRunning) {
@@ -677,9 +675,9 @@ public:
             // closing its own descriptor.
             for (const int client : clientFds_) ::shutdown(client, SHUT_RDWR);
         }
-        idleStopping_ = true;
-        idleCondition_.notify_all();
-        if (idleThread_.joinable()) idleThread_.join();
+        watchdogStopping_ = true;
+        watchdogCondition_.notify_all();
+        if (watchdogThread_.joinable()) watchdogThread_.join();
         // Stop the worker before waiting for request threads. This closes its
         // input pipe and releases requests that were sending audio.
         worker_.stop();
@@ -714,7 +712,7 @@ private:
         } else if (path == "/api/message" && request.method == "POST") {
             const json message = json::parse(request.body);
             if (!message.is_object()) throw std::runtime_error("Message must be a JSON object");
-            lastWorkerUseMs_ = steadyNowMs();
+            lastWorkerMessageMs_ = steadyNowMs();
             if (!worker_.running()) worker_.start();
             try {
                 worker_.send(message);
@@ -754,32 +752,26 @@ private:
         }
     }
 
-    void monitorWorkerIdle() {
-        std::unique_lock<std::mutex> idleLock(idleMutex_);
-        while (!idleStopping_) {
-            idleCondition_.wait_for(idleLock, std::chrono::seconds(10),
-                                    [this] { return idleStopping_.load(); });
-            if (idleStopping_) break;
-            idleLock.unlock();
+    void monitorWorkerResponse() {
+        std::unique_lock<std::mutex> watchdogLock(watchdogMutex_);
+        while (!watchdogStopping_) {
+            watchdogCondition_.wait_for(watchdogLock, std::chrono::seconds(10),
+                                        [this] { return watchdogStopping_.load(); });
+            if (watchdogStopping_) break;
+            watchdogLock.unlock();
             const auto now = steadyNowMs();
             const auto responseTimeoutMs =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     kWorkerResponseTimeout).count();
-            const bool receivingMessages = now - lastWorkerUseMs_.load() < responseTimeoutMs;
+            const bool receivingMessages = now - lastWorkerMessageMs_.load() < responseTimeoutMs;
             if (worker_.running() && worker_.ready() && receivingMessages &&
                 now - worker_.lastCallbackMs() > responseTimeoutMs) {
                 events_.push({{"event", "server_error"},
                               {"message", "TensorRT worker produced no callback for 10 seconds; restarting"}});
                 worker_.restart();
-                lastWorkerUseMs_ = now;
-            } else if (worker_.running() && now - lastWorkerUseMs_.load() >
-                                      std::chrono::duration_cast<std::chrono::milliseconds>(
-                                          kWorkerIdleTimeout).count()) {
-                worker_.stop();
-                events_.push({{"event", "worker_sleeping"},
-                              {"message", "Worker stopped after idle timeout"}});
+                lastWorkerMessageMs_ = now;
             }
-            idleLock.lock();
+            watchdogLock.lock();
         }
     }
 
@@ -852,11 +844,11 @@ private:
     std::size_t activeClients_ = 0;
     std::unordered_set<int> clientFds_;
     std::atomic<std::uint64_t> nextCameraId_{1};
-    std::atomic<bool> idleStopping_{false};
-    std::atomic<std::int64_t> lastWorkerUseMs_{0};
-    std::mutex idleMutex_;
-    std::condition_variable idleCondition_;
-    std::thread idleThread_;
+    std::atomic<bool> watchdogStopping_{false};
+    std::atomic<std::int64_t> lastWorkerMessageMs_{0};
+    std::mutex watchdogMutex_;
+    std::condition_variable watchdogCondition_;
+    std::thread watchdogThread_;
 };
 
 void printUsage(const char* executable) {

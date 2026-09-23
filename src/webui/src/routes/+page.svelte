@@ -750,17 +750,6 @@
       status = 'Restarting worker with saved mapping…';
       return;
     }
-    if (event.event === 'worker_sleeping') {
-      // Leave an idle worker asleep until the user explicitly wakes it. This
-      // avoids repeatedly initializing TensorRT while an inactive tab remains
-      // open.
-      streamId = null;
-      realtimeSamples = [];
-      workerReady = false;
-      status = event.message ?? 'Worker sleeping; click Wake to restart it';
-      statusKind = 'warning';
-      return;
-    }
     if (event.event === 'fatal' || event.event === 'server_error') {
       if (event.message?.includes('restarting')) {
         resumeAfterWorkerRestart ||= Boolean(video && !video.paused);
