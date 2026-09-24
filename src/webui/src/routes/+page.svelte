@@ -20,6 +20,7 @@
 
   type PlaylistItem = { name: string; size: number; url: string; file?: File };
   type ScoreItem = { name: string; score: number; index: number };
+  type HeapPerformance = Performance & { memory?: { usedJSHeapSize: number; totalJSHeapSize: number; jsHeapSizeLimit: number } };
 
   const SAMPLE_RATE = 16000;
   const PACKET_MS = 40;
@@ -58,6 +59,7 @@
   let packetSending = false;
   let pendingAutoPlay = false;
   let pumpTimer: number | undefined;
+  let workerRecoveryTimer: number | undefined;
   let stopped = false;
   let seekWasPlaying = false;
   let suppressSeekRestart = false;
@@ -67,14 +69,50 @@
   let realtimeProcessor: ScriptProcessorNode | null = null;
   let realtimeSamples: number[] = [];
   let realtimePacketChain = Promise.resolve();
+  let realtimePendingPackets = 0;
+  let realtimeBacklogRestarting = false;
   let workerWakeInFlight = false;
   let showSedTimeline = false;
   let timelineCanvas: HTMLCanvasElement;
   let visualizationTimer: number | undefined;
   let playlistAdvancing = false;
+  let debugMode = false;
+  let debugRunning = false;
+  let debugTimer: number | undefined;
+  let debugStartedAt = 0;
+  let debugUptimeSeconds = 0;
+  let debugCompletedMedia = 0;
+  let debugMediaErrors = 0;
+  let debugResults = 0;
+  let debugAudioCallbacks = 0;
+  let debugIdleAudioCallbacks = 0;
+  let debugPacketsQueued = 0;
+  let debugPacketsSent = 0;
+  let debugPendingPackets = 0;
+  let debugMaxPendingPackets = 0;
+  let debugActiveRequests = 0;
+  let debugRequestFailures = 0;
+  let debugLastRequestMs = 0;
+  let debugLastResultAt = 0;
+  let debugLastResultAgeSeconds = 0;
+  let debugLastInferenceMs = 0;
+  let debugLastLagMs = 0;
+  let debugLastSuperseded = 0;
+  let debugPlaybackSeconds = 0;
+  let debugDurationSeconds = 0;
+  let debugHeapMb: number | null = null;
+  let debugLastProgressAt = 0;
+  let debugPreviousPosition = 0;
+  let debugStallReported = false;
+  let debugCallbackGapReported = false;
+  let debugBacklogReported = false;
+  let debugLastReportAt = 0;
 
   const VISUALIZATION_INTERVAL_MS = 100;
   const VISUALIZATION_SECONDS = 10;
+  const DEBUG_REPORT_INTERVAL_MS = 10000;
+  const MAX_REALTIME_PENDING_PACKETS = 100;
+  const AUDIO_POST_TIMEOUT_MS = 8000;
 
   $: currentItem = currentIndex >= 0 ? playlist[currentIndex] : null;
   $: orderedScores = classes
@@ -420,11 +458,136 @@
   }
 
   async function sendMessage(message: Record<string, unknown>): Promise<void> {
-    await api('/api/message', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(message)
-    });
+    const startedAt = performance.now();
+    const controller = message.type === 'audio' ? new AbortController() : null;
+    const timeout = controller
+      ? window.setTimeout(() => controller.abort(), AUDIO_POST_TIMEOUT_MS)
+      : undefined;
+    if (debugMode) debugActiveRequests += 1;
+    try {
+      await api('/api/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(message),
+        signal: controller?.signal
+      });
+      if (debugMode && message.type === 'audio') debugPacketsSent += 1;
+    } catch (error) {
+      if (debugMode) debugRequestFailures += 1;
+      throw error;
+    } finally {
+      if (timeout !== undefined) window.clearTimeout(timeout);
+      if (debugMode) {
+        debugActiveRequests -= 1;
+        debugLastRequestMs = Math.round(performance.now() - startedAt);
+      }
+    }
+  }
+
+  function debugReport(): void {
+    if (!debugMode || !debugRunning || !video) return;
+    const now = performance.now();
+    debugUptimeSeconds = Math.floor((now - debugStartedAt) / 1000);
+    debugPlaybackSeconds = video.currentTime || 0;
+    debugDurationSeconds = Number.isFinite(video.duration) ? video.duration : 0;
+    debugLastResultAgeSeconds = debugLastResultAt ? Math.floor((now - debugLastResultAt) / 1000) : debugUptimeSeconds;
+    const heap = (performance as HeapPerformance).memory;
+    debugHeapMb = heap ? Math.round(heap.usedJSHeapSize / 1048576) : null;
+
+    if (!video.paused && !video.ended && debugPlaybackSeconds > debugPreviousPosition + 0.1) {
+      debugLastProgressAt = now;
+      debugStallReported = false;
+    }
+    debugPreviousPosition = debugPlaybackSeconds;
+    if (!video.paused && !video.ended && now - debugLastProgressAt > 15000 && !debugStallReported) {
+      debugStallReported = true;
+      console.timeStamp('SED playback stalled');
+      console.warn('[SED debug] playback stalled', { media: currentItem?.name, positionSeconds: debugPlaybackSeconds, readyState: video.readyState, networkState: video.networkState });
+    }
+    if (!video.paused && debugLastResultAgeSeconds >= 15 && !debugCallbackGapReported) {
+      debugCallbackGapReported = true;
+      console.timeStamp('SED callback gap');
+      console.warn('[SED debug] no inference callback for 15 seconds', { media: currentItem?.name, streamId, pendingPackets: debugPendingPackets, activeRequests: debugActiveRequests, workerReady, connected });
+    }
+    if (debugPendingPackets > 100 && !debugBacklogReported) {
+      debugBacklogReported = true;
+      console.warn('[SED debug] audio packet backlog', { pendingPackets: debugPendingPackets, maxPendingPackets: debugMaxPendingPackets });
+    }
+    if (debugPendingPackets < 20) debugBacklogReported = false;
+
+    if (now - debugLastReportAt >= DEBUG_REPORT_INTERVAL_MS) {
+      debugLastReportAt = now;
+      console.info('[SED debug] stream snapshot', JSON.stringify({
+        uptimeSeconds: debugUptimeSeconds,
+        media: `${currentIndex + 1}/${playlist.length}`,
+        name: currentItem?.name,
+        completedMedia: debugCompletedMedia,
+        mediaErrors: debugMediaErrors,
+        positionSeconds: Number(debugPlaybackSeconds.toFixed(1)),
+        durationSeconds: Number(debugDurationSeconds.toFixed(1)),
+        paused: video.paused,
+        streamId,
+        workerReady,
+        connected,
+        results: debugResults,
+        lastResultAgeSeconds: debugLastResultAgeSeconds,
+        inferenceMs: debugLastInferenceMs,
+        playbackLagMs: debugLastLagMs,
+        superseded: debugLastSuperseded,
+        audioCallbacks: debugAudioCallbacks,
+        idleAudioCallbacks: debugIdleAudioCallbacks,
+        packetsQueued: debugPacketsQueued,
+        packetsSent: debugPacketsSent,
+        pendingPackets: debugPendingPackets,
+        maxPendingPackets: debugMaxPendingPackets,
+        activeRequests: debugActiveRequests,
+        requestFailures: debugRequestFailures,
+        lastRequestMs: debugLastRequestMs,
+        bufferedSamples: realtimeSamples.length,
+        audioContextState: realtimeContext?.state ?? 'none',
+        jsHeapMb: debugHeapMb,
+        classes: classes.map((name, index) => ({ name, confidencePercent: Number(((scores[index] ?? 0) * 100).toFixed(1)), triggered: (scores[index] ?? 0) * 100 > thresholdPercent }))
+      }));
+    }
+  }
+
+  async function startDebugRun(): Promise<void> {
+    if (!currentItem || currentItem.file || !workerReady || debugRunning) return;
+    debugRunning = true;
+    debugStartedAt = performance.now();
+    debugLastProgressAt = debugStartedAt;
+    debugPreviousPosition = video.currentTime || 0;
+    debugCompletedMedia = 0;
+    debugMediaErrors = 0;
+    debugResults = 0;
+    debugAudioCallbacks = 0;
+    debugIdleAudioCallbacks = 0;
+    debugPacketsQueued = 0;
+    debugPacketsSent = 0;
+    debugPendingPackets = 0;
+    debugMaxPendingPackets = 0;
+    debugRequestFailures = 0;
+    debugLastResultAt = 0;
+    debugCallbackGapReported = false;
+    debugStallReported = false;
+    debugBacklogReported = false;
+    debugLastReportAt = 0;
+    console.info('[SED debug] started', { media: `${currentIndex + 1}/${playlist.length}`, name: currentItem.name, thresholdPercent });
+    console.timeStamp('SED debug run started');
+    try {
+      await startAnalysis(video.currentTime || 0, true);
+    } catch (error) {
+      debugRunning = false;
+      showError(error);
+      console.error('[SED debug] could not start', error);
+    }
+  }
+
+  async function stopDebugRun(): Promise<void> {
+    debugRunning = false;
+    video.pause();
+    await stopStream();
+    console.info('[SED debug] stopped', { uptimeSeconds: debugUptimeSeconds, completedMedia: debugCompletedMedia, results: debugResults });
   }
 
   async function wakeWorkerIfStopped(): Promise<void> {
@@ -434,13 +597,22 @@
       const health = await (await api('/api/health')).json() as {
         worker_running?: boolean;
         worker_ready?: boolean;
+        classes?: string[];
       };
       if (health.worker_ready) {
+        if (health.classes?.length) {
+          classes = health.classes;
+          if (scores.length !== classes.length) scores = classes.map(() => 0);
+        }
         workerReady = classes.length > 0;
         status = workerReady
           ? `TensorRT worker ready · ${classes.length} aggregate classes`
           : 'TensorRT worker ready; synchronizing classes…';
         statusKind = '';
+        if (workerReady && resumeAfterWorkerRestart && video && currentItem) {
+          resumeAfterWorkerRestart = false;
+          void startAnalysis(video.currentTime, true).catch(showError);
+        }
         return;
       }
       if (health.worker_running) {
@@ -505,11 +677,13 @@
       realtimeProcessor.connect(realtimeContext.destination);
       realtimeProcessor.onaudioprocess = (event) => {
         if (streamId === null || video.paused) {
+          if (debugMode && debugRunning) debugIdleAudioCallbacks += 1;
           // Do not let Web Audio's callback clock run ahead of the media
           // element while playback is paused.
           realtimeSamples = [];
           return;
         }
+        if (debugMode && debugRunning) debugAudioCallbacks += 1;
         const input = event.inputBuffer;
         const channels = input.numberOfChannels;
         const frames = input.length;
@@ -524,14 +698,48 @@
           const packet = realtimeSamples.splice(0, PACKET_SAMPLES);
           const timestamp = nextPacketTimestamp;
           nextPacketTimestamp += PACKET_MS;
+          realtimePendingPackets += 1;
+          const debugTracked = debugMode && debugRunning;
+          if (debugTracked) {
+            debugPacketsQueued += 1;
+            debugPendingPackets += 1;
+            debugMaxPendingPackets = Math.max(debugMaxPendingPackets, debugPendingPackets);
+          }
           realtimePacketChain = realtimePacketChain.then(async () => {
-            if (streamId !== id || video.paused) return;
-            await sendMessage({
-              type: 'audio', id, cam_id: camId.trim(), timestamp_ms: timestamp,
-              sample_rate: SAMPLE_RATE, channels: 1, encoding: 's16le',
-              audio_b64: pcmFloatPacket(packet)
-            });
-          }).catch(showError);
+            try {
+              if (streamId !== id || video.paused) return;
+              await sendMessage({
+                type: 'audio', id, cam_id: camId.trim(), timestamp_ms: timestamp,
+                sample_rate: SAMPLE_RATE, channels: 1, encoding: 's16le',
+                audio_b64: pcmFloatPacket(packet)
+              });
+            } finally {
+              realtimePendingPackets -= 1;
+              if (debugTracked) debugPendingPackets = Math.max(0, debugPendingPackets - 1);
+            }
+          }).catch((error) => {
+            if (streamId !== id) return;
+            showError(error);
+            // Stop producing packets after a failed POST. Continuing to queue
+            // one request every 40 ms can grow memory while the server is
+            // unavailable. Health polling will reconnect and resume playback.
+            resumeAfterWorkerRestart = true;
+            workerReady = false;
+            connected = false;
+            video.pause();
+            window.setTimeout(() => void stopStream(), 0);
+          });
+        }
+        if (realtimePendingPackets >= MAX_REALTIME_PENDING_PACKETS && !realtimeBacklogRestarting) {
+          realtimeBacklogRestarting = true;
+          const position = video.currentTime;
+          console.warn('[SED] audio POST backlog reached 100 packets; restarting stream at current playback position');
+          video.pause();
+          void startRealtimeAnalysis(position, true).catch((error) => {
+            showError(error);
+            resumeAfterWorkerRestart = true;
+            workerReady = false;
+          }).finally(() => { realtimeBacklogRestarting = false; });
         }
       };
     }
@@ -605,6 +813,9 @@
     streamId = null;
     pendingAutoPlay = false;
     realtimeSamples = [];
+    // Let the in-flight POST finish before stream_end. Queued packets see the
+    // cleared stream id and drain without sending, so the queue stays bounded.
+    await realtimePacketChain;
     if (id !== null) {
       try {
         await sendMessage({ type: 'stream_end', id, cam_id: camId.trim(), timestamp_ms: nextPacketTimestamp });
@@ -647,6 +858,11 @@
   }
 
   async function handleEnded(): Promise<void> {
+    if (debugMode && debugRunning) {
+      debugCompletedMedia += 1;
+      console.info('[SED debug] media completed', { completedMedia: debugCompletedMedia, media: `${currentIndex + 1}/${playlist.length}`, name: currentItem?.name });
+      console.timeStamp(`SED media completed ${debugCompletedMedia}`);
+    }
     await advancePlaylist();
   }
 
@@ -687,6 +903,10 @@
       }
       status = `No playable media remains: ${failures.join('; ')}`;
       statusKind = 'error';
+      if (debugMode && debugRunning) {
+        debugRunning = false;
+        console.error('[SED debug] run stopped: no playable media remains', failures);
+      }
     } finally {
       playlistAdvancing = false;
     }
@@ -694,6 +914,7 @@
 
   async function handleMediaError(): Promise<void> {
     if (!currentItem || playlistAdvancing) return;
+    if (debugMode && debugRunning) debugMediaErrors += 1;
     const failed = currentItem;
     const reason = mediaErrorDescription();
     console.error('[SED] media playback failed', { name: failed.name, url: failed.url, reason });
@@ -767,6 +988,13 @@
       status = event.message ?? 'Analysis failed';
       statusKind = 'error';
     } else if (event.event === 'result' && event.scores?.length === classes.length) {
+      if (debugMode && debugRunning) {
+        debugResults += 1;
+        debugLastResultAt = performance.now();
+        debugLastInferenceMs = event.processing_ms ?? 0;
+        debugLastSuperseded = event.superseded_packets ?? 0;
+        debugCallbackGapReported = false;
+      }
       scores = [...event.scores];
       signalDb = typeof event.signal_db === 'number' ? event.signal_db : null;
       signalFrequencyHz = typeof event.signal_frequency_hz === 'number'
@@ -774,6 +1002,7 @@
         : null;
       const timestamp = event.timestamp_ms ?? 0;
       const lag = Math.max(0, Math.round(video.currentTime * 1000) - timestamp);
+      if (debugMode && debugRunning) debugLastLagMs = lag;
       const cameraLabel = event.id !== undefined ? `stream-${event.id}` : event.cam_id ?? 'stream';
       status = `${cameraLabel} · ${timestamp} ms · inference ${event.processing_ms ?? 0} ms · playback lag ${lag} ms · superseded ${event.superseded_packets ?? 0}`;
       statusKind = lag > 200 ? 'warning' : '';
@@ -792,14 +1021,33 @@
   function showError(error: unknown): void {
     status = error instanceof Error ? error.message : String(error);
     statusKind = 'error';
+    if (debugMode) console.error('[SED debug] frontend error', error);
+  }
+
+  function handleWindowError(event: ErrorEvent): void {
+    if (debugMode) console.error('[SED debug] uncaught browser error', event.error ?? event.message);
+  }
+
+  function handleUnhandledRejection(event: PromiseRejectionEvent): void {
+    if (debugMode) console.error('[SED debug] unhandled promise rejection', event.reason);
   }
 
   onMount(() => {
+    debugMode = new URLSearchParams(window.location.search).get('debug') === '1';
+    if (debugMode) {
+      console.info('[SED debug] diagnostics enabled; start the run from the page');
+      debugTimer = window.setInterval(debugReport, 1000);
+      window.addEventListener('error', handleWindowError);
+      window.addEventListener('unhandledrejection', handleUnhandledRejection);
+    }
     void registerTabCamera().then(() => wakeWorkerIfStopped()).catch(showError);
     void loadMapping();
     void loadDefaultVideos();
     void pollEvents();
     pumpTimer = window.setInterval(() => void pumpPackets(), 20);
+    workerRecoveryTimer = window.setInterval(() => {
+      if (!workerReady && !workerWakeInFlight) void wakeWorkerIfStopped().catch(showError);
+    }, 10000);
     visualizationTimer = window.setInterval(drawSedTimeline, VISUALIZATION_INTERVAL_MS);
   });
 
@@ -807,7 +1055,11 @@
     unregisterTabCamera();
     stopped = true;
     if (pumpTimer !== undefined) window.clearInterval(pumpTimer);
+    if (workerRecoveryTimer !== undefined) window.clearInterval(workerRecoveryTimer);
     if (visualizationTimer !== undefined) window.clearInterval(visualizationTimer);
+    if (debugTimer !== undefined) window.clearInterval(debugTimer);
+    window.removeEventListener('error', handleWindowError);
+    window.removeEventListener('unhandledrejection', handleUnhandledRejection);
     for (const item of playlist) {
       if (item.file) URL.revokeObjectURL(item.url);
     }
@@ -831,6 +1083,45 @@
 </header>
 
 <main>
+  {#if debugMode}
+    <section class="panel debug-panel" aria-label="Long running browser stream diagnostics">
+      <div class="panel-head"><h2>Browser streaming debug run</h2><small>Device media · same Web UI pipeline</small></div>
+      <div class="buttons">
+        <button class="primary" onclick={() => void startDebugRun()} disabled={debugRunning || !workerReady || !currentItem || Boolean(currentItem?.file)}>Start continuous run</button>
+        <button onclick={() => void stopDebugRun()} disabled={!debugRunning}>Stop</button>
+        <span class="debug-state">{debugRunning ? 'Running until stopped' : 'Stopped'}</span>
+      </div>
+      <div class="debug-grid">
+        <span>Uptime <b>{debugUptimeSeconds}s</b></span>
+        <span>Media <b>{currentIndex + 1}/{playlist.length}</b></span>
+        <span>Completed <b>{debugCompletedMedia}</b></span>
+        <span>Media errors <b>{debugMediaErrors}</b></span>
+        <span>Position <b>{debugPlaybackSeconds.toFixed(1)} / {debugDurationSeconds.toFixed(1)}s</b></span>
+        <span>Results <b>{debugResults}</b></span>
+        <span>Last callback <b>{debugLastResultAgeSeconds}s ago</b></span>
+        <span>Inference <b>{debugLastInferenceMs} ms</b></span>
+        <span>Playback lag <b>{debugLastLagMs} ms</b></span>
+        <span>Superseded <b>{debugLastSuperseded}</b></span>
+        <span>Queued / sent <b>{debugPacketsQueued} / {debugPacketsSent}</b></span>
+        <span>Pending packets <b>{debugPendingPackets} (max {debugMaxPendingPackets})</b></span>
+        <span>Active audio callbacks <b>{debugAudioCallbacks}</b></span>
+        <span>Idle audio callbacks <b>{debugIdleAudioCallbacks}</b></span>
+        <span>HTTP in flight <b>{debugActiveRequests}</b></span>
+        <span>HTTP failures <b>{debugRequestFailures}</b></span>
+        <span>Last POST <b>{debugLastRequestMs} ms</b></span>
+        <span>JS heap <b>{debugHeapMb === null ? 'unavailable' : `${debugHeapMb} MB`}</b></span>
+      </div>
+      <progress class="debug-progress" value={debugPlaybackSeconds} max={debugDurationSeconds || 1} aria-label="Current media playback progress"></progress>
+      <div class="debug-classes">
+        {#each classes as name, index}
+          <span class:triggered={(scores[index] ?? 0) * 100 > thresholdPercent}>
+            <b>{name}</b> {(scores[index] ?? 0) * 100 > thresholdPercent ? 'TRIGGERED' : ''} {((scores[index] ?? 0) * 100).toFixed(1)}%
+          </span>
+        {/each}
+      </div>
+      <p class="debug-note">DevTools Console prints a snapshot every 10 seconds plus media changes, stalls, errors, and callback gaps. Keep this tab visible for a representative long run.</p>
+    </section>
+  {/if}
   <div class="studio">
     <div>
       <section class="panel preview-panel">
@@ -843,11 +1134,11 @@
           {#if !currentItem}<div class="empty-video">Choose one or more video/audio files</div>{/if}
         </div>
         <div class="controls-grid">
-          <label>Camera ID<input bind:value={camId} placeholder="camera-01" /></label>
-          <label>Alert threshold <span>{thresholdPercent.toFixed(1)}%</span><input type="range" min="0" max="100" step="0.5" bind:value={thresholdPercent} /></label>
-          <label>Packet cadence<input value="40 ms" disabled /></label>
+          <label>Camera ID<input name="camera-id" bind:value={camId} placeholder="camera-01" /></label>
+          <label>Alert threshold <span>{thresholdPercent.toFixed(1)}%</span><input name="alert-threshold" type="range" min="0" max="100" step="0.5" bind:value={thresholdPercent} /></label>
+          <label>Packet cadence<input name="packet-cadence" value="40 ms" disabled /></label>
           <label class="visualization-toggle">
-            <input type="checkbox" checked={showSedTimeline} onchange={toggleSedTimeline} />
+            <input name="show-sed-timeline" type="checkbox" checked={showSedTimeline} onchange={toggleSedTimeline} />
             <span>Show SED timeline</span>
           </label>
         </div>
@@ -880,7 +1171,7 @@
           <summary>Media Files</summary>
           <div class="media-files-content">
             <div class="buttons">
-              <input bind:this={fileInput} class="file-native" type="file" multiple accept="video/*,audio/*" onchange={addFiles} />
+              <input name="media-files" bind:this={fileInput} class="file-native" type="file" multiple accept="video/*,audio/*" onchange={addFiles} />
               <button class="primary" onclick={() => fileInput.click()}>Add media files</button>
               <button onclick={() => void runCurrent()} disabled={!currentItem || !workerReady || decoding}>Run current</button>
               <button class="danger" onclick={() => void clearPlaylist()} disabled={!playlist.length}>Clear</button>
@@ -941,11 +1232,11 @@
           <div class="badge-list">
             {#each mappingClasses as name}<span class="badge" style={`--label-color:${colorFor(name)}`}>{name}</span>{/each}
           </div>
-          <textarea bind:value={mappingText} spellcheck="false" aria-label="Class mapping CSV"></textarea>
+          <textarea name="class-mapping" bind:value={mappingText} spellcheck="false" aria-label="Class mapping CSV"></textarea>
           <div class="buttons">
             <button class="primary" onclick={() => void saveMapping()}>Apply and save</button>
             <button onclick={() => void loadMapping()}>Reload saved</button>
-            <input bind:this={mappingInput} class="file-native" type="file" accept=".csv,text/csv" onchange={(event) => void importMapping(event)} />
+            <input name="mapping-file" bind:this={mappingInput} class="file-native" type="file" accept=".csv,text/csv" onchange={(event) => void importMapping(event)} />
             <button onclick={() => mappingInput.click()}>Import CSV</button>
             <button onclick={downloadMapping}>Download CSV</button>
           </div>

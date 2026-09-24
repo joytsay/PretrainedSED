@@ -47,6 +47,7 @@ constexpr std::size_t kMaxBodyBytes = 4 * 1024 * 1024;
 constexpr std::size_t kMaxEvents = 4096;
 constexpr auto kWorkerWriteTimeout = std::chrono::seconds(2);
 constexpr auto kWorkerResponseTimeout = std::chrono::seconds(10);
+constexpr auto kWorkerReadyTimeout = std::chrono::minutes(2);
 
 std::int64_t steadyNowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -219,6 +220,23 @@ public:
         stopLocked();
     }
 
+    bool restartIfExited() {
+        std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
+        const pid_t child = pid_.load();
+        if (child <= 0) {
+            events_.push({{"event", "worker_restarting"}});
+            startLocked();
+            return true;
+        }
+        int status = 0;
+        const pid_t result = ::waitpid(child, &status, WNOHANG);
+        if (result != child && !(result < 0 && errno == ECHILD)) return false;
+        stopLocked();
+        events_.push({{"event", "worker_restarting"}});
+        startLocked();
+        return true;
+    }
+
     void send(const json& message) {
         const std::string line = message.dump() + "\n";
         std::lock_guard<std::mutex> lock(writeMutex_);
@@ -251,6 +269,10 @@ public:
 
     bool running() const { return pid_.load() > 0; }
     bool ready() const { return ready_.load(); }
+    std::vector<std::string> classes() const {
+        std::lock_guard<std::mutex> lock(classesMutex_);
+        return classes_;
+    }
     std::int64_t lastCallbackMs() const { return lastCallbackMs_.load(); }
 
 private:
@@ -287,6 +309,10 @@ private:
         errorFd_ = errorPipe[0];
         pid_ = child;
         ready_ = false;
+        {
+            std::lock_guard<std::mutex> lock(classesMutex_);
+            classes_.clear();
+        }
         lastCallbackMs_ = steadyNowMs();
         outputThread_ = std::thread([this] { readOutput(); });
         errorThread_ = std::thread([this] { readErrors(); });
@@ -295,6 +321,10 @@ private:
     void stopLocked() {
         const pid_t child = pid_.exchange(-1);
         ready_ = false;
+        {
+            std::lock_guard<std::mutex> lock(classesMutex_);
+            classes_.clear();
+        }
         {
             std::lock_guard<std::mutex> lock(writeMutex_);
             if (inputFd_ >= 0) ::close(std::exchange(inputFd_, -1));
@@ -321,6 +351,11 @@ private:
         }
         if (outputThread_.joinable()) outputThread_.join();
         if (errorThread_.joinable()) errorThread_.join();
+        ready_ = false;
+        {
+            std::lock_guard<std::mutex> lock(classesMutex_);
+            classes_.clear();
+        }
         // fdopen/fclose in the reader threads owns and closes these descriptors.
         outputFd_ = -1;
         errorFd_ = -1;
@@ -335,7 +370,14 @@ private:
             lastCallbackMs_ = steadyNowMs();
             try {
                 json callback = json::parse(line);
-                if (callback.value("event", "") == "ready") ready_ = true;
+                if (callback.value("event", "") == "ready") {
+                    const auto classes = callback.at("classes").get<std::vector<std::string>>();
+                    {
+                        std::lock_guard<std::mutex> lock(classesMutex_);
+                        classes_ = classes;
+                    }
+                    ready_ = true;
+                }
                 if (callback.value("event", "") == "fatal") ready_ = false;
                 events_.push(std::move(callback));
             } catch (const std::exception& error) {
@@ -368,6 +410,8 @@ private:
     EventLog& events_;
     std::atomic<pid_t> pid_{-1};
     std::atomic<bool> ready_{false};
+    mutable std::mutex classesMutex_;
+    std::vector<std::string> classes_;
     std::atomic<std::int64_t> lastCallbackMs_{0};
     int inputFd_ = -1;
     int outputFd_ = -1;
@@ -702,7 +746,8 @@ private:
         } else if (path == "/api/health" && request.method == "GET") {
             respond(fd, 200, "application/json",
                     json({{"ok", true}, {"worker_running", worker_.running()},
-                          {"worker_ready", worker_.ready()}}).dump());
+                          {"worker_ready", worker_.ready()},
+                          {"classes", worker_.classes()}}).dump());
         } else if (path == "/api/events" && request.method == "GET") {
             std::uint64_t after = 0;
             const std::string value = queryValue(request.target, "after");
@@ -760,16 +805,31 @@ private:
             if (watchdogStopping_) break;
             watchdogLock.unlock();
             const auto now = steadyNowMs();
-            const auto responseTimeoutMs =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    kWorkerResponseTimeout).count();
-            const bool receivingMessages = now - lastWorkerMessageMs_.load() < responseTimeoutMs;
-            if (worker_.running() && worker_.ready() && receivingMessages &&
-                now - worker_.lastCallbackMs() > responseTimeoutMs) {
+            try {
+                if (!worker_.restartIfExited()) {
+                    const auto responseTimeoutMs =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            kWorkerResponseTimeout).count();
+                    const auto readyTimeoutMs =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            kWorkerReadyTimeout).count();
+                    const bool receivingMessages = now - lastWorkerMessageMs_.load() < responseTimeoutMs;
+                    if (worker_.running() && !worker_.ready() &&
+                        now - worker_.lastCallbackMs() > readyTimeoutMs) {
+                        events_.push({{"event", "server_error"},
+                                      {"message", "TensorRT worker did not become ready within 2 minutes; restarting"}});
+                        worker_.restart();
+                    } else if (worker_.running() && worker_.ready() && receivingMessages &&
+                        now - worker_.lastCallbackMs() > responseTimeoutMs) {
+                        events_.push({{"event", "server_error"},
+                                      {"message", "TensorRT worker produced no callback for 10 seconds; restarting"}});
+                        worker_.restart();
+                        lastWorkerMessageMs_ = now;
+                    }
+                }
+            } catch (const std::exception& error) {
                 events_.push({{"event", "server_error"},
-                              {"message", "TensorRT worker produced no callback for 10 seconds; restarting"}});
-                worker_.restart();
-                lastWorkerMessageMs_ = now;
+                              {"message", std::string("Worker recovery failed: ") + error.what()}});
             }
             watchdogLock.lock();
         }

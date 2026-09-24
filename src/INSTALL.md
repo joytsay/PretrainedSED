@@ -142,6 +142,68 @@ The mapping editor supports reload, local CSV import/download, and validated
 save to the server path supplied by `--mapping`. Applying a mapping restarts
 the worker so its dynamic `classes` array immediately matches the saved CSV.
 
+### Long running browser frontend debug run
+
+After rebuilding `src/webui/dist` with the Svelte build commands above, use
+the normal server on port 8080. If it is not already running, start it from
+the repository root:
+
+```sh
+./run_sed.sh
+```
+
+Open `http://AGX-IP:8080/?debug=1` in Chromium, open DevTools Console, and press
+**Start continuous run** once the worker is ready. A click is needed for browser
+media autoplay. The run uses the normal Web UI path: the device playlist in
+`videos/`, browser media playback and Web Audio capture, 40 ms packets sent to
+`/api/message`, and results received from `/api/events`. It advances through
+all device media and repeats until **Stop** is pressed or the tab closes.
+
+The page shows uptime, media index and progress, completed media, inference
+time, playback lag, superseded packets, all class confidences and triggers,
+packet queue depth, callback age, and JS heap when Chromium exposes it. The
+DevTools Console prints a snapshot every 10 seconds, plus media changes,
+playback stalls, callback gaps, errors, and packet backlog warnings. A rising
+pending-packet count means the browser is producing audio faster than it can
+send it. A rising JS heap alone does not prove a leak: compare it after repeated
+playlist cycles and garbage collection. The JS heap figure excludes browser
+native and GPU allocations. Chromium's Task Manager (`Shift+Esc`) and DevTools
+Performance Monitor can show those other resource trends.
+
+For a browser-process trace, use [Perfetto's Chrome recording guide](https://perfetto.dev/docs/getting-started/chrome-tracing):
+open `https://ui.perfetto.dev`, choose **Record new trace**, set the target to
+**Chrome**, and record around a stall or crash. The Chrome desktop recorder is
+intended for short captures, so keep this debug page running for the long test
+and start tracing when its counters or playback indicate a problem. The console
+also adds a timestamp marker when each media file completes. If Chromium
+crashes, save the latest console output and any completed trace.
+
+To save Console messages automatically before a Chromium crash, run the browser
+with a local DevTools port and a separate profile. On the machine running
+Chromium, use two terminals:
+
+```sh
+chromium --user-data-dir=/tmp/psed-chromium-debug \
+  --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
+  'http://AGX-IP:8080/?debug=1'
+```
+
+```sh
+node scripts/capture_browser_console.mjs \
+  --url 'http://AGX-IP:8080/?debug=1' \
+  --output /tmp/psed-browser-console.jsonl
+```
+
+Press **Start continuous run** in Chromium. The Node process appends every
+Console message, JavaScript exception, failed network request, HTTP error, and
+tab-crash event to the JSON Lines file as it arrives. It keeps waiting if
+Chromium exits, so the records already written survive a crash. Stop the
+recorder with Ctrl+C. Node.js 22 or newer is required. The debugging port is
+bound to localhost; Chrome 136 and newer require a separate profile for a
+remote debugging port. The normal DevTools Console also has **Save as...** in
+its right-click menu, but that saves only messages currently visible when you
+click it.
+
 To build only the non-Qt programs on a machine without Qt, configure with
 `-DBUILD_QT_TESTBED=OFF`. This preserves the original Qt source and executable.
 
