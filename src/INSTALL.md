@@ -206,3 +206,28 @@ subsequent result timestamps with the video timeline. Pause and seek operations
 also pause or restart the audio stream so the two timelines do not drift apart.
 The timeline supports both handle dragging and direct click-to-seek. After the
 last playlist item reaches end-of-media, playback wraps to the first item.
+
+## Long streaming test
+
+Build and run the C++ worker endurance test on the AGX/container from `/workspace`:
+
+```sh
+cmake --build build-agx --target atst_sed_long_stream_test -j4
+./build-agx/atst_sed_long_stream_test
+```
+
+It sends 40 ms PCM packets from the same top-level `videos/` media files listed
+by the web UI. It runs until Ctrl+C, moving to the next video after at most
+20 seconds and wrapping the playlist as needed. The terminal keeps a fixed
+display showing worker uptime, inference time, playback lag, superseded packet
+count, playlist position (for example `2/11` on the device), total completed media, playback
+segment progress, and each class by name with its confidence.
+The progress bar shows streamed audio time against the configured per-media
+segment length (20 seconds by default). Classes above the 10% alert
+threshold are labeled `TRIGGERED`; `--threshold-percent` changes that threshold.
+The display also refreshes every five seconds while waiting for callbacks.
+It fails if the worker exits, reports an error, stops acknowledging streams, or
+stops producing results. `--media-seconds` changes the per-video segment and
+`--report-seconds` changes log frequency. The `--worker`, `--engine`,
+`--mapping`, `--labels`, `--videos-root`, and `--ffmpeg` options override the
+default paths. Ctrl+C closes the current stream and stops the worker cleanly.

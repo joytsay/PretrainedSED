@@ -29,6 +29,12 @@ target_link_libraries(atst_sed_web_testbed PRIVATE
     nlohmann_json::nlohmann_json
 )
 
+add_executable(atst_sed_long_stream_test tests/long_streaming.cpp)
+target_link_libraries(atst_sed_long_stream_test PRIVATE
+    Threads::Threads
+    nlohmann_json::nlohmann_json
+)
+
 option(BUILD_SVELTE_UI "Build the Svelte web UI with the web testbed" ON)
 if(BUILD_SVELTE_UI)
     find_program(NPM_EXECUTABLE npm)
