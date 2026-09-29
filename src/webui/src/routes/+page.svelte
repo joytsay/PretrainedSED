@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import SoundIcon from '../components/SoundIcon.svelte';
   import '../app.css';
   import displayNamesText from '../../../../mid_to_display_name.tsv?raw';
@@ -51,18 +51,18 @@
   let status = 'Connecting to callback worker…';
   let statusKind: '' | 'error' | 'warning' = '';
   let eventSequence = 0;
-  let audioBuffer: AudioBuffer | null = null;
-  let decoding = false;
   let streamId: number | null = null;
   let nextPacketTimestamp = 0;
   let requestCounter = 0;
-  let packetSending = false;
-  let pendingAutoPlay = false;
-  let pumpTimer: number | undefined;
   let workerRecoveryTimer: number | undefined;
   let stopped = false;
+  const lifetime = new AbortController();
+  let operationVersion = 0;
+  let playlistVersion = 0;
+  let starting = false;
+  let closingStream = Promise.resolve();
+  let streamStartRequest = Promise.resolve();
   let seekWasPlaying = false;
-  let suppressSeekRestart = false;
   let resumeAfterWorkerRestart = false;
   let realtimeContext: AudioContext | null = null;
   let realtimeSource: MediaElementAudioSourceNode | null = null;
@@ -113,6 +113,8 @@
   const DEBUG_REPORT_INTERVAL_MS = 10000;
   const MAX_REALTIME_PENDING_PACKETS = 100;
   const AUDIO_POST_TIMEOUT_MS = 8000;
+  // Event polling holds a request open for up to 20 seconds on the server.
+  const API_TIMEOUT_MS = 30000;
 
   $: currentItem = currentIndex >= 0 ? playlist[currentIndex] : null;
   $: orderedScores = classes
@@ -263,9 +265,13 @@
   async function api(path: string, options?: RequestInit): Promise<Response> {
     let response: Response;
     try {
-      response = await fetch(path, options);
+      if (stopped) throw new DOMException('Page destroyed', 'AbortError');
+      response = await fetch(path, {
+        ...options,
+        signal: AbortSignal.any([lifetime.signal, AbortSignal.timeout(API_TIMEOUT_MS), ...(options?.signal ? [options.signal] : [])])
+      });
     } catch (error) {
-      console.error('[SED] request failed', path, error);
+      if (!stopped) console.error('[SED] request failed', path, error);
       throw error;
     }
     if (!response.ok) {
@@ -282,7 +288,9 @@
 
   async function loadMapping(): Promise<void> {
     try {
-      mappingText = await (await api('/api/mapping')).text();
+      const text = await (await api('/api/mapping')).text();
+      if (stopped) return;
+      mappingText = text;
       status = `Loaded ${aggregateNames(mappingText).length} aggregate classes from class_mapping.csv`;
       statusKind = '';
     } catch (error) {
@@ -291,8 +299,10 @@
   }
 
   async function loadDefaultVideos(): Promise<void> {
+    const version = playlistVersion;
     try {
       const payload = await (await api('/api/videos')).json();
+      if (stopped || version !== playlistVersion) return;
       const defaults: PlaylistItem[] = (payload.videos ?? []).map(
         (item: { name: string; size: number; url: string }) => ({
           name: item.name,
@@ -303,6 +313,7 @@
       if (defaults.length) {
         playlist = defaults;
         await selectItem(0);
+        if (stopped || version !== playlistVersion) return;
         status = `Loaded ${defaults.length} media files from ${payload.root}`;
         statusKind = '';
       } else {
@@ -317,6 +328,7 @@
   async function saveMapping(): Promise<void> {
     try {
       await stopStream();
+      if (stopped) return;
       workerReady = false;
       status = 'Validating mapping and restarting worker…';
       await api('/api/mapping', {
@@ -341,11 +353,17 @@
   async function importMapping(event: Event): Promise<void> {
     const input = event.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
-    if (file) mappingText = await file.text();
+    if (file) {
+      const text = await file.text();
+      if (stopped) return;
+      mappingText = text;
+    }
     input.value = '';
   }
 
   function addFiles(event: Event): void {
+    if (stopped) return;
+    playlistVersion += 1;
     const input = event.currentTarget as HTMLInputElement;
     const additions = Array.from(input.files ?? []).map((file) => ({
       name: file.name,
@@ -354,38 +372,45 @@
       url: URL.createObjectURL(file)
     }));
     playlist = [...playlist, ...additions];
-    if (currentIndex < 0 && playlist.length) selectItem(0);
+    if (currentIndex < 0 && playlist.length) void selectItem(0).catch(showError);
     input.value = '';
   }
 
   async function clearPlaylist(): Promise<void> {
+    playlistVersion += 1;
+    resumeAfterWorkerRestart = false;
     video?.pause();
-    await stopStream();
+    const closing = stopStream();
+    video?.removeAttribute('src');
+    video?.load();
     for (const item of playlist) {
       if (item.file) URL.revokeObjectURL(item.url);
     }
     playlist = [];
     currentIndex = -1;
-    audioBuffer = null;
     scores = classes.map(() => 0);
     signalDb = null;
     signalFrequencyHz = null;
     status = 'Playlist cleared';
+    await closing;
   }
 
   async function selectItem(index: number, autoPlay = false): Promise<void> {
-    if (index < 0 || index >= playlist.length) return;
+    if (stopped || index < 0 || index >= playlist.length) return;
     video?.pause();
-    await stopStream();
+    const closing = stopStream();
+    const version = operationVersion;
+    await closing;
+    if (stopped || version !== operationVersion) return;
     currentIndex = index;
-    audioBuffer = null;
     resetSedTimeline();
     scores = classes.map(() => 0);
     signalDb = null;
     signalFrequencyHz = null;
     status = `Selected ${playlist[index].name}`;
     statusKind = '';
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await tick();
+    if (stopped || version !== operationVersion) return;
     video.load();
     if (autoPlay) {
       // Start muted to satisfy browser autoplay policy, then restore sound once
@@ -400,49 +425,6 @@
         showError(error);
       }
     }
-  }
-
-  async function decodeCurrent(): Promise<AudioBuffer> {
-    if (audioBuffer) return audioBuffer;
-    if (!currentItem) throw new Error('Choose at least one video or audio file');
-    decoding = true;
-    status = `Decoding audio from ${currentItem.name}…`;
-    try {
-      const AudioContextConstructor = window.AudioContext ?? window.webkitAudioContext;
-      if (!AudioContextConstructor) throw new Error('This browser does not provide Web Audio');
-      const context = new AudioContextConstructor();
-      const encodedMedia = currentItem.file
-        ? await currentItem.file.arrayBuffer()
-        : await (await api(currentItem.url)).arrayBuffer();
-      audioBuffer = await context.decodeAudioData(encodedMedia);
-      await context.close();
-      return audioBuffer;
-    } finally {
-      decoding = false;
-    }
-  }
-
-  function pcmPacket(buffer: AudioBuffer, timestampMs: number): string {
-    const bytes = new Uint8Array(PACKET_SAMPLES * 2);
-    const view = new DataView(bytes.buffer);
-    const sourceStart = timestampMs * buffer.sampleRate / 1000;
-    for (let sample = 0; sample < PACKET_SAMPLES; sample += 1) {
-      const sourcePosition = sourceStart + sample * buffer.sampleRate / SAMPLE_RATE;
-      const left = Math.floor(sourcePosition);
-      const fraction = sourcePosition - left;
-      let value = 0;
-      for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
-        const data = buffer.getChannelData(channel);
-        const a = left < data.length ? data[left] : 0;
-        const b = left + 1 < data.length ? data[left + 1] : a;
-        value += a + (b - a) * fraction;
-      }
-      value = Math.max(-1, Math.min(1, value / Math.max(1, buffer.numberOfChannels)));
-      view.setInt16(sample * 2, value < 0 ? Math.round(value * 32768) : Math.round(value * 32767), true);
-    }
-    let binary = '';
-    for (let offset = 0; offset < bytes.length; offset += 1) binary += String.fromCharCode(bytes[offset]);
-    return btoa(binary);
   }
 
   function pcmFloatPacket(samples: number[]): string {
@@ -526,6 +508,9 @@
         positionSeconds: Number(debugPlaybackSeconds.toFixed(1)),
         durationSeconds: Number(debugDurationSeconds.toFixed(1)),
         paused: video.paused,
+        playlistFiles: playlist.length,
+        uploadedBytes: playlist.reduce((total, item) => total + (item.file ? item.size : 0), 0),
+        queuedPackets: realtimePendingPackets,
         streamId,
         workerReady,
         connected,
@@ -591,7 +576,7 @@
   }
 
   async function wakeWorkerIfStopped(): Promise<void> {
-    if (workerWakeInFlight) return;
+    if (stopped || workerWakeInFlight) return;
     workerWakeInFlight = true;
     try {
       const health = await (await api('/api/health')).json() as {
@@ -599,6 +584,7 @@
         worker_ready?: boolean;
         classes?: string[];
       };
+      if (stopped) return;
       if (health.worker_ready) {
         if (health.classes?.length) {
           classes = health.classes;
@@ -649,9 +635,11 @@
     try {
       const response = await api('/api/session');
       const payload = await response.json() as { camera_id?: string };
+      if (stopped) return;
       tabCameraId = payload.camera_id ?? 'cam-01';
       camId = tabCameraId;
     } catch {
+      if (stopped) return;
       tabCameraId = 'cam-01';
       camId = tabCameraId;
     }
@@ -662,6 +650,7 @@
   }
 
   async function setupRealtimeAudio(): Promise<AudioContext> {
+    if (stopped) throw new DOMException('Page destroyed', 'AbortError');
     const AudioContextConstructor = window.AudioContext ?? window.webkitAudioContext;
     if (!AudioContextConstructor) throw new Error('This browser does not provide Web Audio');
     if (!realtimeContext) {
@@ -676,7 +665,7 @@
       // Keep normal video playback audible while copying its audio to packets.
       realtimeProcessor.connect(realtimeContext.destination);
       realtimeProcessor.onaudioprocess = (event) => {
-        if (streamId === null || video.paused) {
+        if (stopped || streamId === null || video.paused) {
           if (debugMode && debugRunning) debugIdleAudioCallbacks += 1;
           // Do not let Web Audio's callback clock run ahead of the media
           // element while playback is paused.
@@ -694,7 +683,7 @@
           realtimeSamples.push(sample);
         }
         const id = streamId;
-        while (realtimeSamples.length >= PACKET_SAMPLES && streamId === id) {
+        while (realtimeSamples.length >= PACKET_SAMPLES && streamId === id && realtimePendingPackets < MAX_REALTIME_PENDING_PACKETS) {
           const packet = realtimeSamples.splice(0, PACKET_SAMPLES);
           const timestamp = nextPacketTimestamp;
           nextPacketTimestamp += PACKET_MS;
@@ -727,7 +716,7 @@
             workerReady = false;
             connected = false;
             video.pause();
-            window.setTimeout(() => void stopStream(), 0);
+            void stopStream();
           });
         }
         if (realtimePendingPackets >= MAX_REALTIME_PENDING_PACKETS && !realtimeBacklogRestarting) {
@@ -748,81 +737,68 @@
   }
 
   async function startRealtimeAnalysis(positionSeconds: number, autoPlay: boolean): Promise<void> {
+    if (stopped || !currentItem) return;
     video.pause();
-    await stopStream();
-    await setupRealtimeAudio();
-    realtimeSamples = [];
-    resetSedTimeline();
-    realtimePacketChain = Promise.resolve();
-    streamId = newStreamId();
-    nextPacketTimestamp = Math.max(0, Math.floor(positionSeconds * 1000 / PACKET_MS) * PACKET_MS);
-    pendingAutoPlay = false;
-    const id = streamId;
-    await sendMessage({ type: 'stream_start', id, cam_id: camId.trim(), timestamp_ms: nextPacketTimestamp });
-    if (autoPlay) await video.play();
-    status = `Streaming live 40 ms audio from ${currentItem?.name ?? 'media'}…`;
+    const closing = stopStream();
+    const version = operationVersion;
+    starting = true;
+    try {
+      await closing;
+      if (stopped || version !== operationVersion) return;
+      await setupRealtimeAudio();
+      if (stopped || version !== operationVersion) return;
+      realtimeSamples = [];
+      resetSedTimeline();
+      realtimePacketChain = Promise.resolve();
+      streamId = newStreamId();
+      nextPacketTimestamp = Math.max(0, Math.floor(positionSeconds * 1000 / PACKET_MS) * PACKET_MS);
+      const id = streamId;
+      streamStartRequest = sendMessage({ type: 'stream_start', id, cam_id: camId.trim(), timestamp_ms: nextPacketTimestamp });
+      await streamStartRequest;
+      if (stopped || version !== operationVersion) return;
+      if (autoPlay) await video.play();
+      if (stopped || version !== operationVersion) return;
+      status = `Streaming live 40 ms audio from ${currentItem?.name ?? 'media'}…`;
+    } catch (error) {
+      if (stopped || version !== operationVersion) return;
+      await stopStream();
+      throw error;
+    } finally {
+      if (version === operationVersion) starting = false;
+    }
   }
 
   async function startAnalysis(positionSeconds = 0, autoPlay = true): Promise<void> {
+    if (stopped) return;
     if (!workerReady) throw new Error('The TensorRT worker is not ready');
     if (!camId.trim()) throw new Error('Camera ID must not be empty');
-    if (currentItem && !currentItem.file) {
-      await startRealtimeAnalysis(positionSeconds, autoPlay);
-      return;
-    }
-    video.pause();
-    await stopStream();
-    const buffer = await decodeCurrent();
-    resetSedTimeline();
-    const timestamp = Math.max(0, Math.floor(positionSeconds * 1000 / PACKET_MS) * PACKET_MS);
-    streamId = newStreamId();
-    nextPacketTimestamp = timestamp;
-    pendingAutoPlay = autoPlay;
-    const id = streamId;
-    await sendMessage({ type: 'stream_start', id, cam_id: camId.trim(), timestamp_ms: timestamp });
-    await sendNextPacket(buffer, id);
-    status = `Pre-rolling ${currentItem?.name ?? 'media'} at ${timestamp} ms…`;
+    if (!currentItem) throw new Error('Choose at least one video or audio file');
+    await startRealtimeAnalysis(positionSeconds, autoPlay);
   }
 
-  async function sendNextPacket(buffer: AudioBuffer, id: number): Promise<void> {
+  function stopStream(): Promise<void> {
+    operationVersion += 1;
+    starting = false;
+    const id = streamId;
+    const camera = camId.trim();
     const timestamp = nextPacketTimestamp;
-    await sendMessage({
-      type: 'audio', id, cam_id: camId.trim(), timestamp_ms: timestamp,
-      sample_rate: SAMPLE_RATE, channels: 1, encoding: 's16le',
-      audio_b64: pcmPacket(buffer, timestamp)
-    });
-    if (streamId === id) nextPacketTimestamp += PACKET_MS;
-  }
-
-  async function pumpPackets(): Promise<void> {
-    if (packetSending || streamId === null || !audioBuffer || !video || video.paused || video.ended) return;
-    packetSending = true;
-    const id = streamId;
-    try {
-      const target = Math.floor(video.currentTime * 1000 / PACKET_MS) * PACKET_MS;
-      while (streamId === id && nextPacketTimestamp <= target) await sendNextPacket(audioBuffer, id);
-    } catch (error) {
-      showError(error);
-    } finally {
-      packetSending = false;
-    }
-  }
-
-  async function stopStream(): Promise<void> {
-    const id = streamId;
     streamId = null;
-    pendingAutoPlay = false;
     realtimeSamples = [];
-    // Let the in-flight POST finish before stream_end. Queued packets see the
-    // cleared stream id and drain without sending, so the queue stays bounded.
-    await realtimePacketChain;
-    if (id !== null) {
-      try {
-        await sendMessage({ type: 'stream_end', id, cam_id: camId.trim(), timestamp_ms: nextPacketTimestamp });
-      } catch {
-        // A mapping save may restart the worker before this close reaches it.
+    const packets = realtimePacketChain;
+    const startRequest = streamStartRequest;
+    closingStream = closingStream.then(async () => {
+      await packets;
+      // Preserve start/end ordering when Clear or selection interrupts startup.
+      await startRequest.catch(() => {});
+      if (id !== null && !stopped) {
+        try {
+          await sendMessage({ type: 'stream_end', id, cam_id: camera, timestamp_ms: timestamp });
+        } catch {
+          // The worker may already have stopped or the page may have closed.
+        }
       }
-    }
+    });
+    return closingStream;
   }
 
   async function runCurrent(): Promise<void> {
@@ -838,7 +814,7 @@
       realtimeSamples = [];
       return;
     }
-    if (decoding) return;
+    if (stopped || starting) return;
     try { await startAnalysis(video.currentTime, true); }
     catch (error) { showError(error); }
   }
@@ -848,10 +824,6 @@
   }
 
   async function handleSeeked(): Promise<void> {
-    if (suppressSeekRestart) {
-      suppressSeekRestart = false;
-      return;
-    }
     if (streamId === null) return;
     try { await startAnalysis(video.currentTime, seekWasPlaying); }
     catch (error) { showError(error); }
@@ -879,18 +851,19 @@
   }
 
   async function advancePlaylist(retryCurrent = false): Promise<void> {
-    if (playlistAdvancing || !playlist.length) return;
+    if (stopped || playlistAdvancing || !playlist.length) return;
     playlistAdvancing = true;
     const failures: string[] = [];
     const startIndex = currentIndex;
     try {
       await stopStream();
-      for (let attempt = 0; attempt < playlist.length; attempt += 1) {
+      for (let attempt = 0; !stopped && attempt < playlist.length; attempt += 1) {
         const offset = attempt + (retryCurrent ? 0 : 1);
         const index = (startIndex + offset) % playlist.length;
         const item = playlist[index];
         try {
           await selectItem(index);
+          if (stopped) return;
           await startAnalysis(0, true);
           return;
         } catch (error) {
@@ -927,6 +900,7 @@
     while (!stopped) {
       try {
         const payload = await (await api(`/api/events?after=${eventSequence}`)).json();
+        if (stopped) return;
         connected = true;
         // The server periodically compacts its bounded event log and resets
         // its sequence.  Restart from zero so we receive the worker's ready
@@ -938,19 +912,29 @@
         eventSequence = payload.next ?? eventSequence;
         for (const envelope of payload.events ?? []) handleWorkerEvent(envelope.data as WorkerEvent);
       } catch (error) {
+        if (stopped) return;
         console.error('[SED] event polling failed', error);
         connected = false;
         if (!stopped) {
           status = `Server connection lost: ${error instanceof Error ? error.message : String(error)}`;
           statusKind = 'error';
-          await new Promise((resolve) => setTimeout(resolve, 1000));
+          await new Promise<void>((resolve) => {
+            const finish = () => {
+              window.clearTimeout(timer);
+              lifetime.signal.removeEventListener('abort', finish);
+              resolve();
+            };
+            const timer = window.setTimeout(finish, 1000);
+            lifetime.signal.addEventListener('abort', finish, { once: true });
+          });
         }
       }
     }
   }
 
   function handleWorkerEvent(event: WorkerEvent): void {
-    if (event.event !== 'result') console.info('[SED] worker event', event);
+    if (stopped) return;
+    if (debugMode && event.event !== 'result' && event.event !== 'worker_log') console.info('[SED] worker event', event);
     if (event.event === 'ready') {
       classes = event.classes ?? [];
       scores = classes.map(() => 0);
@@ -965,6 +949,8 @@
     }
     if (event.event === 'worker_restarting') {
       resumeAfterWorkerRestart ||= Boolean(video && !video.paused);
+      operationVersion += 1;
+      starting = false;
       streamId = null;
       realtimeSamples = [];
       workerReady = false;
@@ -1006,19 +992,11 @@
       const cameraLabel = event.id !== undefined ? `stream-${event.id}` : event.cam_id ?? 'stream';
       status = `${cameraLabel} · ${timestamp} ms · inference ${event.processing_ms ?? 0} ms · playback lag ${lag} ms · superseded ${event.superseded_packets ?? 0}`;
       statusKind = lag > 200 ? 'warning' : '';
-      if (pendingAutoPlay) {
-        pendingAutoPlay = false;
-        suppressSeekRestart = true;
-        video.currentTime = timestamp / 1000;
-        video.play().catch(() => {
-          status = 'Analysis is ready. Press play to continue (browser autoplay was blocked).';
-          statusKind = 'warning';
-        });
-      }
     }
   }
 
   function showError(error: unknown): void {
+    if (stopped) return;
     status = error instanceof Error ? error.message : String(error);
     statusKind = 'error';
     if (debugMode) console.error('[SED debug] frontend error', error);
@@ -1044,7 +1022,6 @@
     void loadMapping();
     void loadDefaultVideos();
     void pollEvents();
-    pumpTimer = window.setInterval(() => void pumpPackets(), 20);
     workerRecoveryTimer = window.setInterval(() => {
       if (!workerReady && !workerWakeInFlight) void wakeWorkerIfStopped().catch(showError);
     }, 10000);
@@ -1054,7 +1031,19 @@
   onDestroy(() => {
     unregisterTabCamera();
     stopped = true;
-    if (pumpTimer !== undefined) window.clearInterval(pumpTimer);
+    lifetime.abort();
+    video?.pause();
+    video?.removeAttribute('src');
+    video?.load();
+    if (streamId !== null) {
+      // Teardown notification must survive cancellation of normal page requests.
+      void fetch('/api/message', {
+        method: 'POST', keepalive: true,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'stream_end', id: streamId, cam_id: camId.trim(), timestamp_ms: nextPacketTimestamp }),
+        signal: AbortSignal.timeout(AUDIO_POST_TIMEOUT_MS)
+      }).catch(() => {});
+    }
     if (workerRecoveryTimer !== undefined) window.clearInterval(workerRecoveryTimer);
     if (visualizationTimer !== undefined) window.clearInterval(visualizationTimer);
     if (debugTimer !== undefined) window.clearInterval(debugTimer);
@@ -1063,9 +1052,14 @@
     for (const item of playlist) {
       if (item.file) URL.revokeObjectURL(item.url);
     }
+    if (realtimeProcessor) realtimeProcessor.onaudioprocess = null;
     realtimeProcessor?.disconnect();
     realtimeSource?.disconnect();
-    void realtimeContext?.close();
+    void realtimeContext?.close().catch(() => {});
+    realtimeProcessor = null;
+    realtimeSource = null;
+    realtimeContext = null;
+    playlist = [];
     void stopStream();
   });
 </script>
@@ -1173,7 +1167,7 @@
             <div class="buttons">
               <input name="media-files" bind:this={fileInput} class="file-native" type="file" multiple accept="video/*,audio/*" onchange={addFiles} />
               <button class="primary" onclick={() => fileInput.click()}>Add media files</button>
-              <button onclick={() => void runCurrent()} disabled={!currentItem || !workerReady || decoding}>Run current</button>
+              <button onclick={() => void runCurrent()} disabled={!currentItem || !workerReady || starting}>Run current</button>
               <button class="danger" onclick={() => void clearPlaylist()} disabled={!playlist.length}>Clear</button>
             </div>
           </div>
