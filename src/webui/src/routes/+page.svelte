@@ -18,6 +18,8 @@
     message?: string;
   };
 
+  class StreamRequestError extends Error {}
+
   type PlaylistItem = { name: string; size: number; url: string; file?: File };
   type ScoreItem = { name: string; score: number; index: number };
   type HeapPerformance = Performance & { memory?: { usedJSHeapSize: number; totalJSHeapSize: number; jsHeapSizeLimit: number } };
@@ -78,6 +80,9 @@
   let playlistAdvancing = false;
   let debugMode = false;
   let debugRunning = false;
+  let continuousResumeInFlight = false;
+  let lastContinuousResumeAt = -Infinity;
+  let selectingMedia = 0;
   let debugTimer: number | undefined;
   let debugStartedAt = 0;
   let debugUptimeSeconds = 0;
@@ -223,6 +228,15 @@
   function toggleSedTimeline(event: Event): void {
     showSedTimeline = (event.currentTarget as HTMLInputElement).checked;
     if (showSedTimeline) requestAnimationFrame(resetSedTimeline);
+  }
+
+  function formatUptime(totalSeconds: number): string {
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+    if (minutes > 0) return `${minutes}m ${seconds}s`;
+    return `${seconds}s`;
   }
 
   function parseCsvRow(line: string): string[] {
@@ -377,6 +391,7 @@
   }
 
   async function clearPlaylist(): Promise<void> {
+    debugRunning = false;
     playlistVersion += 1;
     resumeAfterWorkerRestart = false;
     video?.pause();
@@ -397,33 +412,38 @@
 
   async function selectItem(index: number, autoPlay = false): Promise<void> {
     if (stopped || index < 0 || index >= playlist.length) return;
-    video?.pause();
-    const closing = stopStream();
-    const version = operationVersion;
-    await closing;
-    if (stopped || version !== operationVersion) return;
-    currentIndex = index;
-    resetSedTimeline();
-    scores = classes.map(() => 0);
-    signalDb = null;
-    signalFrequencyHz = null;
-    status = `Selected ${playlist[index].name}`;
-    statusKind = '';
-    await tick();
-    if (stopped || version !== operationVersion) return;
-    video.load();
-    if (autoPlay) {
-      // Start muted to satisfy browser autoplay policy, then restore sound once
-      // playback has begun. The media source is still routed directly to the
-      // speakers by setupRealtimeAudio().
-      video.muted = true;
-      try {
-        await video.play();
-        video.muted = false;
-      } catch (error) {
-        video.muted = false;
-        showError(error);
+    selectingMedia += 1;
+    try {
+      video?.pause();
+      const closing = stopStream();
+      const version = operationVersion;
+      await closing;
+      if (stopped || version !== operationVersion) return;
+      currentIndex = index;
+      resetSedTimeline();
+      scores = classes.map(() => 0);
+      signalDb = null;
+      signalFrequencyHz = null;
+      status = `Selected ${playlist[index].name}`;
+      statusKind = '';
+      await tick();
+      if (stopped || version !== operationVersion) return;
+      video.load();
+      if (autoPlay) {
+        // Start muted to satisfy browser autoplay policy, then restore sound once
+        // playback has begun. The media source is still routed directly to the
+        // speakers by setupRealtimeAudio().
+        video.muted = true;
+        try {
+          await video.play();
+          video.muted = false;
+        } catch (error) {
+          video.muted = false;
+          showError(error);
+        }
       }
+    } finally {
+      selectingMedia -= 1;
     }
   }
 
@@ -456,13 +476,41 @@
       if (debugMode && message.type === 'audio') debugPacketsSent += 1;
     } catch (error) {
       if (debugMode) debugRequestFailures += 1;
-      throw error;
+      throw new StreamRequestError(error instanceof Error ? error.message : String(error));
     } finally {
       if (timeout !== undefined) window.clearTimeout(timeout);
       if (debugMode) {
         debugActiveRequests -= 1;
         debugLastRequestMs = Math.round(performance.now() - startedAt);
       }
+    }
+  }
+
+  async function maintainContinuousPlayback(): Promise<void> {
+    if (stopped || !debugRunning || !currentItem || !video || !video.paused || video.ended || video.seeking || video.error) return;
+    if (starting || selectingMedia || playlistAdvancing || realtimeBacklogRestarting || resumeAfterWorkerRestart || !workerReady || continuousResumeInFlight) return;
+    const now = performance.now();
+    if (now - lastContinuousResumeAt < 5000) return;
+    lastContinuousResumeAt = now;
+    continuousResumeInFlight = true;
+    const version = operationVersion;
+    try {
+      console.warn('[SED] resuming paused continuous playback', { media: currentItem.name, positionSeconds: video.currentTime, completedMedia: debugCompletedMedia });
+      if (streamId === null) {
+        await startAnalysis(video.currentTime, true);
+      } else {
+        // Preserve the packet clock when resuming the same media and stream.
+        await realtimeContext?.resume();
+        if (stopped || !debugRunning || version !== operationVersion) return;
+        await video.play();
+      }
+    } catch (error) {
+      if (!stopped && debugRunning) {
+        showError(error);
+        console.warn('[SED] continuous playback resume failed; will retry', error);
+      }
+    } finally {
+      continuousResumeInFlight = false;
     }
   }
 
@@ -539,6 +587,7 @@
   async function startDebugRun(): Promise<void> {
     if (!currentItem || currentItem.file || !workerReady || debugRunning) return;
     debugRunning = true;
+    lastContinuousResumeAt = -Infinity;
     debugStartedAt = performance.now();
     debugLastProgressAt = debugStartedAt;
     debugPreviousPosition = video.currentTime || 0;
@@ -570,6 +619,7 @@
 
   async function stopDebugRun(): Promise<void> {
     debugRunning = false;
+    resumeAfterWorkerRestart = false;
     video.pause();
     await stopStream();
     console.info('[SED debug] stopped', { uptimeSeconds: debugUptimeSeconds, completedMedia: debugCompletedMedia, results: debugResults });
@@ -595,7 +645,7 @@
           ? `TensorRT worker ready · ${classes.length} aggregate classes`
           : 'TensorRT worker ready; synchronizing classes…';
         statusKind = '';
-        if (workerReady && resumeAfterWorkerRestart && video && currentItem) {
+        if (workerReady && resumeAfterWorkerRestart && !starting && !playlistAdvancing && video && currentItem) {
           resumeAfterWorkerRestart = false;
           void startAnalysis(video.currentTime, true).catch(showError);
         }
@@ -762,10 +812,22 @@
     } catch (error) {
       if (stopped || version !== operationVersion) return;
       await stopStream();
+      if (!stopped && version + 1 === operationVersion && autoPlay && error instanceof StreamRequestError) {
+        schedulePlaybackRecovery(error);
+      }
       throw error;
     } finally {
       if (version === operationVersion) starting = false;
     }
+  }
+
+  function schedulePlaybackRecovery(error: unknown): void {
+    if (stopped || !currentItem) return;
+    resumeAfterWorkerRestart = true;
+    workerReady = false;
+    status = `Playback interrupted; retrying when the worker is ready: ${error instanceof Error ? error.message : String(error)}`;
+    statusKind = 'warning';
+    console.warn('[SED] playback recovery scheduled', { media: currentItem.name, positionSeconds: video.currentTime, completedMedia: debugCompletedMedia, reason: status });
   }
 
   async function startAnalysis(positionSeconds = 0, autoPlay = true): Promise<void> {
@@ -819,13 +881,24 @@
     catch (error) { showError(error); }
   }
 
+  function handlePause(): void {
+    if (!debugMode || !debugRunning || stopped) return;
+    console.info('[SED debug] playback paused', {
+      media: currentItem?.name, completedMedia: debugCompletedMedia,
+      positionSeconds: video.currentTime, ended: video.ended,
+      starting, playlistAdvancing, recoveryPending: resumeAfterWorkerRestart,
+      backlogRestarting: realtimeBacklogRestarting, pendingPackets: realtimePendingPackets,
+      workerReady, streamId, audioContextState: realtimeContext?.state ?? 'none'
+    });
+  }
+
   function handleSeeking(): void {
     seekWasPlaying = !video.paused;
   }
 
   async function handleSeeked(): Promise<void> {
     if (streamId === null) return;
-    try { await startAnalysis(video.currentTime, seekWasPlaying); }
+    try { await startAnalysis(video.currentTime, debugRunning || seekWasPlaying); }
     catch (error) { showError(error); }
   }
 
@@ -867,6 +940,13 @@
           await startAnalysis(0, true);
           return;
         } catch (error) {
+          if (stopped) return;
+          // A server outage affects every file. Keep this item selected and let
+          // health polling retry instead of exhausting the playlist.
+          if (!video?.error && (error instanceof StreamRequestError || !workerReady)) {
+            schedulePlaybackRecovery(error);
+            return;
+          }
           const reason = video?.error ? mediaErrorDescription() :
             (error instanceof Error ? error.message : String(error));
           console.error('[SED] skipping unplayable media', { name: item.name, url: item.url, reason });
@@ -941,7 +1021,7 @@
       workerReady = classes.length > 0;
       status = `TensorRT worker ready · ${classes.length} aggregate classes`;
       statusKind = '';
-      if (resumeAfterWorkerRestart) {
+      if (resumeAfterWorkerRestart && !starting && !playlistAdvancing) {
         resumeAfterWorkerRestart = false;
         void startAnalysis(video.currentTime, true).catch(showError);
       }
@@ -996,7 +1076,7 @@
   }
 
   function showError(error: unknown): void {
-    if (stopped) return;
+    if (stopped || resumeAfterWorkerRestart) return;
     status = error instanceof Error ? error.message : String(error);
     statusKind = 'error';
     if (debugMode) console.error('[SED debug] frontend error', error);
@@ -1014,7 +1094,10 @@
     debugMode = new URLSearchParams(window.location.search).get('debug') === '1';
     if (debugMode) {
       console.info('[SED debug] diagnostics enabled; start the run from the page');
-      debugTimer = window.setInterval(debugReport, 1000);
+      debugTimer = window.setInterval(() => {
+        debugReport();
+        void maintainContinuousPlayback();
+      }, 1000);
       window.addEventListener('error', handleWindowError);
       window.addEventListener('unhandledrejection', handleUnhandledRejection);
     }
@@ -1023,7 +1106,7 @@
     void loadDefaultVideos();
     void pollEvents();
     workerRecoveryTimer = window.setInterval(() => {
-      if (!workerReady && !workerWakeInFlight) void wakeWorkerIfStopped().catch(showError);
+      if ((!workerReady || resumeAfterWorkerRestart) && !workerWakeInFlight) void wakeWorkerIfStopped().catch(showError);
     }, 10000);
     visualizationTimer = window.setInterval(drawSedTimeline, VISUALIZATION_INTERVAL_MS);
   });
@@ -1070,8 +1153,8 @@
   <div class="brand"><img class="mark" src="/logo_cloud.svg" alt="" aria-hidden="true" /><div><strong>GeoVision SED</strong><span>Sound Event Detection</span></div></div>
   <button type="button" class="connection" class:online={connected && workerReady}
     class:actionable={connected && !workerReady} disabled={!connected || workerReady || workerWakeInFlight}
-    title={connected && !workerReady ? 'Wake the TensorRT worker' : undefined}
-    onclick={() => void wakeWorkerIfStopped().catch(showError)}>
+    title={connected && !workerReady ? 'Apply and save class mapping, then wake the TensorRT worker' : undefined}
+    onclick={() => void saveMapping()}>
     {workerWakeInFlight ? 'Waking worker…' : connected ? (workerReady ? 'Worker ready' : 'Worker stopped · Wake') : 'Offline'}
   </button>
 </header>
@@ -1083,10 +1166,10 @@
       <div class="buttons">
         <button class="primary" onclick={() => void startDebugRun()} disabled={debugRunning || !workerReady || !currentItem || Boolean(currentItem?.file)}>Start continuous run</button>
         <button onclick={() => void stopDebugRun()} disabled={!debugRunning}>Stop</button>
-        <span class="debug-state">{debugRunning ? 'Running until stopped' : 'Stopped'}</span>
+        <span class="debug-state">{debugRunning ? 'Continuous playback · use Stop to pause' : 'Stopped'}</span>
       </div>
       <div class="debug-grid">
-        <span>Uptime <b>{debugUptimeSeconds}s</b></span>
+        <span>Uptime <b>{formatUptime(debugUptimeSeconds)}</b></span>
         <span>Media <b>{currentIndex + 1}/{playlist.length}</b></span>
         <span>Completed <b>{debugCompletedMedia}</b></span>
         <span>Media errors <b>{debugMediaErrors}</b></span>
@@ -1123,7 +1206,7 @@
         <div class="video-shell">
           <!-- svelte-ignore a11y_media_has_caption -->
           <video bind:this={video} src={currentItem?.url} controls playsinline
-            onplay={() => void handleNativePlay()} onseeking={handleSeeking} onseeked={() => void handleSeeked()}
+            onplay={() => void handleNativePlay()} onpause={handlePause} onseeking={handleSeeking} onseeked={() => void handleSeeked()}
             onended={() => void handleEnded()} onerror={() => void handleMediaError()}></video>
           {#if !currentItem}<div class="empty-video">Choose one or more video/audio files</div>{/if}
         </div>
