@@ -408,17 +408,19 @@ slider controls speech playback from 0–100% (default 100%) and updates while
 speech is playing. Name the reference and select **Create
 shared voice** to save it on the server. Saved voices appear in every client
 after refresh; **Delete shared voice** removes the selected clone globally.
-Use **Play TTS** to check the selected voice and permit audio playback. Enable spoken alerts to read the exact mapped
-`class_name` once when confidence rises above the threshold. A class rearms when
-its confidence falls to or below the threshold. Simultaneous alerts play in
+Use **Play TTS** to check the selected voice and permit audio playback. Enable **TTS trigger** to read the mapped `class_name`. **On delay** requires
+confidence to stay above threshold before speaking; **Off delay** requires it
+to stay at or below threshold before the same class can trigger again. Both
+default to 0.2 seconds, with number-input arrows in 0.1-second steps. Brief
+confidence fluctuations do not trigger speech or rearm a class. Simultaneous alerts play in
 sequence through one synthesis/playback queue. Each utterance finishes before
 the next starts, including across media stream restarts; only explicit
 cancellation or leaving the page interrupts playback. Previews join the same
 queue. The **TTS speed** slider adjusts playback from 0.5× to 2×, defaulting to
 1.5× with pitch preserved. Speed changes apply during playback too. When media ends, pending
 detector alerts are discarded, including an alert still being generated; an
-utterance already playing finishes. Parenthetical class details are spoken too, with pauses between
-slash-separated sounds. The **Media volume during speech** slider controls
+utterance already playing finishes. TTS reads the class title only, omitting parenthetical details
+from the mapping. The **Media volume during speech** slider controls
 playback volume from 0–100% of its current level, defaulting to 20%;
 the detector still receives the original signal. Completion, cancellation,
 playback failure, and stream shutdown restore normal output.
