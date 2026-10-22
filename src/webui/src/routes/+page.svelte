@@ -84,7 +84,7 @@
   let realtimePendingPackets = 0;
   let realtimeBacklogRestarting = false;
   let workerWakeInFlight = false;
-  let showSedTimeline = false;
+  let showSedTimeline = true;
   let timelineCanvas: HTMLCanvasElement;
   let visualizationTimer: number | undefined;
   let playlistAdvancing = false;
@@ -1231,8 +1231,9 @@
           <label>Alert threshold <span>{thresholdPercent.toFixed(1)}%</span><input name="alert-threshold" type="range" min="0" max="100" step="0.5" bind:value={thresholdPercent} /></label>
           <label>Packet cadence<input name="packet-cadence" value="40 ms" disabled /></label>
           <label class="visualization-toggle">
-            <input name="show-sed-timeline" type="checkbox" checked={showSedTimeline} onchange={toggleSedTimeline} />
+            <input class="toggle-switch" name="show-sed-timeline" type="checkbox" role="switch" aria-label="Show SED timeline" checked={showSedTimeline} onchange={toggleSedTimeline} />
             <span>Show SED timeline</span>
+            <span class="toggle-state">{showSedTimeline ? 'On' : 'Off'}</span>
           </label>
         </div>
         {#if showSedTimeline}

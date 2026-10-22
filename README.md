@@ -412,7 +412,8 @@ slider controls speech playback from 0–100% (default 100%) and updates while
 speech is playing. Name the reference and select **Create
 shared voice** to save it on the server. Saved voices appear in every client
 after refresh; **Delete shared voice** removes the selected clone globally.
-Use **Play TTS** to check the selected voice and permit audio playback. Enable **TTS trigger** to read the mapped `class_name`. **On delay** requires
+Use **Play TTS** to check the selected voice and permit audio playback. **Show SED timeline** and **TTS trigger** are on by default and use matching
+on/off switches. TTS reads the mapped `class_name`. **On delay** requires
 confidence to stay above threshold before speaking; **Off delay** requires it
 to stay at or below threshold before the same class can trigger again. Both
 default to 0.2 seconds, with number-input arrows in 0.1-second steps. Brief

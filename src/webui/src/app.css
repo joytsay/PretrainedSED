@@ -73,7 +73,11 @@ label { display:block; color:#b8cae4; font-size:11px; font-weight:700 }
 input,textarea { width:100%; margin-top:5px; padding:8px 10px; border:1px solid #2a405f; border-radius:8px; outline:none; color:#edf5ff; background:#081426 }
 input:focus,textarea:focus { border-color:var(--blue); box-shadow:0 0 0 3px rgba(106,168,255,.12) } input[type="range"] { padding:0; accent-color:#62d8c8 }
 .visualization-toggle { min-height:35px; display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid #2a405f; border-radius:8px; background:#081426; cursor:pointer; white-space:normal }
-.visualization-toggle input { width:15px; height:15px; margin:0; padding:0; accent-color:#55d9ca; cursor:pointer }
+input.toggle-switch { appearance:none; position:relative; flex:0 0 38px; width:38px; height:22px; margin:0; padding:0; border-radius:12px; background:#243955; cursor:pointer }
+input.toggle-switch::before { content:''; position:absolute; top:3px; left:3px; width:14px; height:14px; border-radius:50%; background:#edf5ff; transition:transform .15s }
+input.toggle-switch:checked { background:#23887e; border-color:#55d9ca }
+input.toggle-switch:checked::before { transform:translateX(16px) }
+.toggle-state { margin-left:auto; color:#8290aa }
 .visualization-toggle span { color:#c8d9ef }
 .sed-visualization { margin-top:12px; padding:12px; border:1px solid #263e5e; border-radius:9px; background:#050d19 }
 .visualization-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:8px }

@@ -11,7 +11,7 @@
   let ttsSpeed = 1;
   let speaking = false;
   $: duck(speaking, duckPercent);
-  let enabled = false;
+  let enabled = true;
   let onDelaySeconds = 0.2;
   let offDelaySeconds = 0.2;
   let base = '';
@@ -315,7 +315,7 @@ Merci de votre coopération.`
 <details class="panel mapping-panel voice-panel" ontoggle={event => { if (event.currentTarget.open) void refreshVoices(); }}>
   <summary class="mapping-summary"><strong>Voice cloning & spoken alerts</strong></summary>
   <div class="mapping-content voice-content">
-    <label class="alert-toggle"><input type="checkbox" role="switch" aria-label="TTS trigger" bind:checked={enabled} /><span>TTS trigger</span><span class="switch-state">{enabled ? 'On' : 'Off'}</span></label>
+    <label class="alert-toggle"><input class="toggle-switch" type="checkbox" role="switch" aria-label="TTS trigger" bind:checked={enabled} /><span>TTS trigger</span><span class="toggle-state">{enabled ? 'On' : 'Off'}</span></label>
     <div class="voice-fields trigger-timing">
       <label>On delay (seconds)<input aria-label="TTS trigger on delay" type="number" min="0.1" step="0.1" bind:value={onDelaySeconds} onchange={() => onDelaySeconds = timingSeconds(onDelaySeconds)} title="Stay above threshold for this long before speaking" /></label>
       <label>Off delay (seconds)<input aria-label="TTS trigger off delay" type="number" min="0.1" step="0.1" bind:value={offDelaySeconds} onchange={() => offDelaySeconds = timingSeconds(offDelaySeconds)} title="Stay below threshold for this long before allowing the class to trigger again" /></label>
@@ -376,11 +376,6 @@ Merci de votre coopération.`
   .voice-content select { display: block; width: 100%; min-width: 0; margin-top: 5px; padding: 8px 10px; border: 1px solid #2a405f; border-radius: 8px; color: #edf5ff; background: #081426; font: inherit; }
   .voice-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 12px; align-items: end; }
   .voice-content .alert-toggle { display: flex; align-items: center; gap: 9px; line-height: 1.5; cursor: pointer; }
-  .voice-content .alert-toggle input { appearance: none; position: relative; flex: 0 0 38px; width: 38px; height: 22px; margin: 0; padding: 0; border-radius: 12px; background: #243955; cursor: pointer; }
-  .voice-content .alert-toggle input::before { content: ''; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: #edf5ff; transition: transform .15s; }
-  .voice-content .alert-toggle input:checked { background: #23887e; border-color: #55d9ca; }
-  .voice-content .alert-toggle input:checked::before { transform: translateX(16px); }
-  .switch-state { margin-left: auto; color: #8290aa; }
   .volume-control > span { display: flex; justify-content: space-between; gap: 12px; }
   .volume-control input { display: block; height: 20px; }
   .voice-content .buttons { margin: 0; align-items: center; }
