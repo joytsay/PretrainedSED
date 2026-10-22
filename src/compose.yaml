@@ -49,3 +49,57 @@ services:
           --videos-root /workspace/videos \
           --host 0.0.0.0 \
           --port 8080
+
+  # Adapted from audio.cpp AGX Compose for STT and TTS only.
+  voice-ai:
+    profiles: [audio]
+    image: psed-audiocpp-agx:local
+    container_name: ${PSED_AUDIO_CONTAINER_NAME:-psed-audiocpp}
+    build:
+      context: ../docker/audiocpp
+      dockerfile: Dockerfile
+      additional_contexts:
+        audiocpp-source: ${AUDIOCPP_SOURCE:-../../audio.cpp}
+      target: full
+      args:
+        CUDA_VERSION: ${CUDA_VERSION:?Set CUDA_VERSION to the CUDA release provided by JetPack}
+        UBUNTU_VERSION: ${UBUNTU_VERSION:-22.04}
+        BASE_CUDA_DEV_CONTAINER: ${BASE_CUDA_DEV_CONTAINER:-docker.io/nvidia/cuda:12.6.3-devel-ubuntu22.04}
+        BASE_CUDA_RUN_CONTAINER: ${BASE_CUDA_RUN_CONTAINER:-nvcr.io/nvidia/l4t-cuda:12.6.11-runtime}
+        GCC_VERSION: ${GCC_VERSION:-11}
+        CUDA_DOCKER_ARCH: ${CUDA_ARCH:-87-real}
+        AUDIOCPP_MODEL_SET: custom
+        AUDIOCPP_MODELS: parakeet_tdt,pocket_tts
+        AUDIOCPP_CPU_ALL_VARIANTS: "OFF"
+        BUILD_JOBS: ${BUILD_JOBS:-2}
+    runtime: nvidia
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    restart: unless-stopped
+    stop_grace_period: 45s
+    ports:
+      - "${PSED_AUDIO_PORT:-8091}:8081"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+    entrypoint: [/bin/bash, -ec]
+    command:
+      - |
+        /app/audiocpp_model_manager install parakeet_tdt_q8_0 --models-dir /app/models
+        /app/audiocpp_model_manager install pocket_tts_english_q8_0 --models-dir /app/models
+        /app/audiocpp_model_manager install pocket_tts_french_q8_0 --models-dir /app/models
+        exec /app/audiocpp_server --config /app/sed-server.json
+    volumes:
+      - audio-models:/app/models
+      - ../docker/audiocpp/server.json:/app/sed-server.json:ro
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:8081/health]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      # The initial start downloads the STT and two language-specific TTS packages before serving requests.
+      start_period: 30m
+
+volumes:
+  audio-models:

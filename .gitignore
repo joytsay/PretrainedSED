@@ -207,3 +207,6 @@ cache/
 /PTSED
 /output
 /eval_aug*
+
+# Shared non-secret Compose defaults for the optional audio.cpp profile.
+!src/.env

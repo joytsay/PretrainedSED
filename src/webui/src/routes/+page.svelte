@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
+  import VoiceAlerts from '../components/VoiceAlerts.svelte';
   import SoundIcon from '../components/SoundIcon.svelte';
   import '../app.css';
   import displayNamesText from '../../../../mid_to_display_name.tsv?raw';
@@ -67,6 +68,12 @@
   let seekWasPlaying = false;
   let resumeAfterWorkerRestart = false;
   let realtimeContext: AudioContext | null = null;
+  let playbackGain: GainNode | null = null;
+  let speechDucking = false;
+  function duckMedia(speaking: boolean): void {
+    speechDucking = speaking;
+    if (playbackGain) playbackGain.gain.value = speaking ? 0.2 : 1;
+  }
   let realtimeSource: MediaElementAudioSourceNode | null = null;
   let realtimeProcessor: ScriptProcessorNode | null = null;
   let realtimeSamples: number[] = [];
@@ -711,7 +718,10 @@
       // Keep an independent, reliable audio path. Some WebAudio
       // implementations produce a silent ScriptProcessor output until its
       // output buffer is explicitly filled.
-      realtimeSource.connect(realtimeContext.destination);
+      playbackGain = realtimeContext.createGain();
+      playbackGain.gain.value = speechDucking ? 0.2 : 1;
+      realtimeSource.connect(playbackGain);
+      playbackGain.connect(realtimeContext.destination);
       // Keep normal video playback audible while copying its audio to packets.
       realtimeProcessor.connect(realtimeContext.destination);
       realtimeProcessor.onaudioprocess = (event) => {
@@ -1138,6 +1148,7 @@
     if (realtimeProcessor) realtimeProcessor.onaudioprocess = null;
     realtimeProcessor?.disconnect();
     realtimeSource?.disconnect();
+    playbackGain?.disconnect();
     void realtimeContext?.close().catch(() => {});
     realtimeProcessor = null;
     realtimeSource = null;
@@ -1301,6 +1312,8 @@
         {/each}
       </div>
       </section>
+
+      <VoiceAlerts triggered={triggeredScores.map(item => item.name)} active={streamId !== null} duck={duckMedia} />
 
       <details class="panel mapping-panel">
         <summary class="mapping-summary"><strong>Class Mapping</strong><small>{mappingClasses.length} aggregate labels</small></summary>

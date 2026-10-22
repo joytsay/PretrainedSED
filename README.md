@@ -356,3 +356,59 @@ To complement the simplified DESED setup presented earlier, we provide results f
 [7] J. Ebbers, R. Haeb-Umbach, and R. Serizel, “Threshold independent evaluation of sound event detection scores,” in Proceedings of the International Conference on Acoustics, Speech and Signal Processing (ICASSP), 2022.
 
 [8] N. Shao, X. Li, and X. Li, “Fine-tune the pretrained ATST model for sound event detection,” in Proceedings of the International Conference on Acoustics, Speech and Signal Processing (ICASSP), 2024
+
+### Cloned voice alerts (audio.cpp MVP)
+
+Choose whether to start audio.cpp with the SED Compose stack:
+
+```sh
+# SED only
+docker compose -f src/compose.yaml up -d
+
+# SED plus audio.cpp
+docker compose -f src/compose.yaml --profile audio up --build -d
+```
+
+The optional `voice-ai` service in `src/compose.yaml` is adapted from audio.cpp's
+AGX Compose setup. The local `docker/audiocpp/Dockerfile` builds only the
+audio server and tools, skipping audio.cpp's embedded WebUI build and its
+knowledge, prompt, and hotword data. It uses just the
+Parakeet-TDT and PocketTTS model families; no llama.cpp or RAG workers are built or
+started. The audio API is exposed on host port 8091 (container port 8081).
+The container name defaults to `psed-audiocpp`, allowing coexistence with the
+standalone audio.cpp stack. Override with `PSED_AUDIO_PORT` and
+`PSED_AUDIO_CONTAINER_NAME`; if you change the port, update the UI API URL too.
+It uses the sibling `../audio.cpp` source checkout for the build. Set
+`AUDIOCPP_SOURCE` to an absolute path for another checkout.
+`src/.env` defaults to CUDA 12.6.3; override `CUDA_VERSION` for your JetPack.
+Startup installs Parakeet-TDT v3 0.6B Q8 for French/English STT and PocketTTS
+100M Q8 English and French packages for cloned speech into the persistent
+`audio-models` Docker volume before starting the API server.
+Select the speech language in the voice accordion. PocketTTS uses separate
+language checkpoints and does not require the reference transcript for cloning.
+Class names are spoken verbatim; use French labels in the mapping for French
+alerts. This selection targets low latency; Jetson inference latency has not
+yet been measured.
+See [Parakeet](https://github.com/0xShug0/audio.cpp/blob/main/docs/models/parakeet_tdt.md)
+and [PocketTTS](https://github.com/0xShug0/audio.cpp/blob/main/model_specs/pocket_tts.json).
+The SED config overlay enables cross-origin API requests for the separate UI.
+First build, model downloads, and first synthesis can take several minutes.
+Inspect startup with `docker compose -f src/compose.yaml --profile audio logs -f voice-ai`.
+To stop a previously enabled audio service, run
+`docker compose -f src/compose.yaml --profile audio stop voice-ai`.
+
+Open **Voice cloning & spoken alerts** below the confidence panel. Upload a
+short single-speaker recording or record one (microphone requires localhost or
+HTTPS), review its automatic transcript, and use **Play TTS** to check the voice
+and permit audio playback. Enable spoken alerts to read the exact mapped
+`class_name` once when confidence rises above the threshold. A class rearms when
+its confidence falls to or below the threshold. Simultaneous alerts play in
+sequence. During speech the media output drops to 20% of its current level;
+the detector still receives the original signal. Completion, cancellation,
+playback failure, and stream shutdown restore normal output.
+
+The API URL defaults to the browser's current hostname on port 8091 (`/v1`).
+Change it for a remote server. HTTPS pages require an HTTPS audio.cpp URL.
+The MVP allows cross-origin requests and exposes a model-management API;
+run it on a trusted network. Voice recordings and transcripts remain in the
+current tab; upload again after reload.
