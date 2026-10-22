@@ -93,41 +93,54 @@ export async function browserDecodeToWav(
   }
 }
 
-/** Raise quiet generated speech, compressing peaks before PCM encoding. */
-export async function boostSpeechVolume(audio: Blob): Promise<Blob> {
-  // Offline processing avoids a second live audio path or autoplay requirement.
+/** Normalize speech-active RMS, excluding pauses and retaining peak headroom. */
+export function normalizeAudioLevel(buffer: AudioBuffer, targetDb = -16): AudioBuffer {
+  const channels = Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel));
+  const windowFrames = Math.max(1, Math.round(buffer.sampleRate * 0.02));
+  const windows: Array<{ power: number; count: number; rms: number }> = [];
+  let peak = 0;
+  let maximumRms = 0;
+  for (let start = 0; start < buffer.length; start += windowFrames) {
+    const end = Math.min(buffer.length, start + windowFrames);
+    let power = 0;
+    for (const samples of channels) {
+      for (let frame = start; frame < end; frame += 1) {
+        const sample = samples[frame];
+        peak = Math.max(peak, Math.abs(sample));
+        power += sample * sample;
+      }
+    }
+    const count = (end - start) * channels.length;
+    const rms = Math.sqrt(power / count);
+    maximumRms = Math.max(maximumRms, rms);
+    windows.push({ power, count, rms });
+  }
+  // Do not amplify silence or a near-silent microphone's noise floor.
+  const gate = Math.max(0.001, maximumRms * 0.1);
+  let speechPower = 0;
+  let speechSamples = 0;
+  for (const window of windows) {
+    if (window.rms < gate) continue;
+    speechPower += window.power;
+    speechSamples += window.count;
+  }
+  if (!speechSamples || !peak) return buffer;
+  const rms = Math.sqrt(speechPower / speechSamples);
+  const gain = Math.min(16, Math.pow(10, targetDb / 20) / rms, 0.95 / peak);
+  for (const samples of channels) {
+    for (let frame = 0; frame < samples.length; frame += 1) samples[frame] *= gain;
+  }
+  return buffer;
+}
+
+export async function normalizeSpeechVolume(audio: Blob, targetDb = -16): Promise<Blob> {
   const decoder = new OfflineAudioContext(1, 1, 24000);
   const decoded = await decoder.decodeAudioData(await audio.arrayBuffer());
-  // Preserve the final syllable through the compressor's look-ahead delay.
-  const tailFrames = Math.ceil(decoded.sampleRate * 0.02);
-  const offline = new OfflineAudioContext(decoded.numberOfChannels, decoded.length + tailFrames, decoded.sampleRate);
-  const source = offline.createBufferSource();
-  source.buffer = decoded;
-  const gain = offline.createGain();
-  gain.gain.value = 4; // +12 dB before limiting.
-  const compressor = offline.createDynamicsCompressor();
-  compressor.threshold.value = -6;
-  compressor.knee.value = 6;
-  compressor.ratio.value = 12;
-  compressor.attack.value = 0.003;
-  compressor.release.value = 0.08;
-  source.connect(gain);
-  gain.connect(compressor);
-  compressor.connect(offline.destination);
-  source.start();
-  const rendered = await offline.startRendering();
+  return encodePcm16Wav(normalizeAudioLevel(decoded, targetDb));
+}
 
-  // Retain headroom even if a transient passes the compressor's attack window.
-  let peak = 0;
-  for (let channel = 0; channel < rendered.numberOfChannels; channel += 1) {
-    for (const sample of rendered.getChannelData(channel)) peak = Math.max(peak, Math.abs(sample));
-  }
-  if (peak > 0.95) {
-    const scale = 0.95 / peak;
-    for (let channel = 0; channel < rendered.numberOfChannels; channel += 1) {
-      const samples = rendered.getChannelData(channel);
-      for (let frame = 0; frame < samples.length; frame += 1) samples[frame] *= scale;
-    }
-  }
-  return encodePcm16Wav(rendered);
+export async function normalizeReferenceVoice(file: File): Promise<File> {
+  const wav = await browserDecodeToWav(file, 24000, 1);
+  const normalized = await normalizeSpeechVolume(wav);
+  return new File([normalized], `${file.name.replace(/\.[^.]+$/, '')}.wav`, { type: 'audio/wav' });
 }

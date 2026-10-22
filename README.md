@@ -401,9 +401,13 @@ Open **Voice cloning & spoken alerts** below the confidence panel. Choose a
 woman or man preset without uploading a reference, or upload/record a short
 single-speaker reference (microphone requires localhost or HTTPS). The woman
 preset uses the bundled Fantine reference (English) or Cosette (French); the man preset uses
-audio.cpp's bundled male reference. The French woman preset gets a +12 dB
-playback boost with peak compression and headroom protection. This speech
-boost is independent of the media-volume slider. The separate **TTS volume**
+audio.cpp's bundled male reference. Recorded/uploaded clone references are
+normalized before preview and saving (speech-active RMS target −16 dBFS).
+Existing saved references are normalized when used for cloning. All generated
+voices—woman, man, and clones—share a −16 dBFS speech-active RMS playback
+target, with peak headroom and a gain cap. Pauses and near-silent noise are
+excluded from the level measurement; high peaks can limit the achievable
+loudness. The volume and media-ducking sliders remain independent. The separate **TTS volume**
 slider controls speech playback from 0–100% (default 100%) and updates while
 speech is playing. Name the reference and select **Create
 shared voice** to save it on the server. Saved voices appear in every client
@@ -417,7 +421,7 @@ sequence through one synthesis/playback queue. Each utterance finishes before
 the next starts, including across media stream restarts; only explicit
 cancellation or leaving the page interrupts playback. Previews join the same
 queue. The **TTS speed** slider adjusts playback from 0.5× to 2×, defaulting to
-1.5× with pitch preserved. Speed changes apply during playback too. When media ends, pending
+1× with pitch preserved. Speed changes apply during playback too. When media ends, pending
 detector alerts are discarded, including an alert still being generated; an
 utterance already playing finishes. TTS reads the class title only, omitting parenthetical details
 from the mapping. The **Media volume during speech** slider controls

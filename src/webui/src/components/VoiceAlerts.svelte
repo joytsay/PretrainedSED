@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { boostSpeechVolume, browserDecodeToWav } from './audio';
+  import { browserDecodeToWav, normalizeReferenceVoice, normalizeSpeechVolume } from './audio';
   import { TriggerTiming } from './trigger-timing';
   export let triggered: string[] = [];
   export let active = false;
@@ -8,7 +8,7 @@
   export let duck: (speaking: boolean, volumePercent: number) => void;
   let duckPercent = 20;
   let ttsVolumePercent = 100;
-  let ttsSpeed = 1.5;
+  let ttsSpeed = 1;
   let speaking = false;
   $: duck(speaking, duckPercent);
   let enabled = false;
@@ -26,7 +26,20 @@
   let reference: File | null = null;
   let referenceUrl = '';
   let transcript = '';
-  let previewText = 'Emergency Sounds';
+  const previewScripts = {
+    'pocket-english': `This is a voice recording for GeoVision.
+It will be used to generate a simulated voice for testing purposes.
+Thank you for your cooperation.`,
+    'pocket-french': `Ceci est un enregistrement vocal pour GeoVision.
+Il sera utilisé pour générer une voix simulée à des fins de test.
+Merci de votre coopération.`
+  };
+  let previewText = previewScripts['pocket-english'];
+  $: updatePreviewLanguage(ttsModel);
+  function updatePreviewLanguage(model: string) {
+    if (Object.values(previewScripts).includes(previewText))
+      previewText = model === 'pocket-french' ? previewScripts['pocket-french'] : previewScripts['pocket-english'];
+  }
   let status = '';
   let busy = false;
   let recording = false;
@@ -151,19 +164,31 @@
   function spokenLabel(label: string) {
     return label.replace(/\s*\([^)]*\)/g, '').replace(/\//g, ', ').replace(/\s+/g, ' ').trim();
   }
-  async function upload(file: File, signal: AbortSignal, rate: number) {
-    const wav = await browserDecodeToWav(file, rate, 1);
+  async function upload(file: File, signal: AbortSignal, rate: number, normalizeReference = false) {
+    let wav = await browserDecodeToWav(file, rate, 1);
+    if (normalizeReference) wav = await normalizeSpeechVolume(wav);
     return (await (await request('ui/upload', wav, signal, false)).json()).path as string;
   }
   async function choose(file: File | null) {
     cancel();
     if (referenceUrl) URL.revokeObjectURL(referenceUrl);
-    reference = file;
-    referenceUrl = file ? URL.createObjectURL(file) : '';
+    reference = null;
+    referenceUrl = '';
     transcript = '';
-    voice = file ? 'draft' : 'woman';
+    voice = 'woman';
     voiceName = file?.name.replace(/\.[^.]+$/, '') || '';
-    if (file) await transcribe();
+    if (!file) return;
+    busy = true;
+    status = 'Normalizing reference voice…';
+    try {
+      const normalized = await normalizeReferenceVoice(file);
+      if (disposed) return;
+      reference = normalized;
+      referenceUrl = URL.createObjectURL(normalized);
+      voice = 'draft';
+    } catch (error) { if (!disposed) status = String(error); }
+    finally { busy = false; }
+    if (reference && !disposed) await transcribe();
   }
   async function transcribe() {
     if (!reference || busy) return;
@@ -188,20 +213,19 @@
     const { text } = job;
     const aborter = new AbortController(); controller = aborter;
     status = `Generating: ${text}`;
-    const boostFrenchWoman = ttsModel === 'pocket-french' && voice === 'woman';
     const body: Record<string, unknown> = { model: ttsModel, input: spokenLabel(text), response_format: 'wav' };
     if (voice === 'woman' || voice === 'man') body.voice = voice;
     else {
       const saved = voices.find(item => `saved:${item.id}` === voice);
       const file = saved ? new File([Uint8Array.from(atob(saved.audio), char => char.charCodeAt(0))], 'reference.wav', { type: 'audio/wav' }) : reference;
       if (!file || (voice !== 'draft' && !saved)) throw new Error('Select a saved voice or record a reference first.');
-      body.voice_ref = await upload(file, aborter.signal, 24000);
+      body.voice_ref = await upload(file, aborter.signal, 24000, true);
       body.reference_text = saved?.transcript ?? transcript;
     }
     const response = await request('audio/speech', JSON.stringify(body), aborter.signal);
     let blob = await response.blob();
     if (aborter.signal.aborted || disposed || staleAlert(job)) return;
-    if (boostFrenchWoman) blob = await boostSpeechVolume(blob);
+    blob = await normalizeSpeechVolume(blob);
     if (aborter.signal.aborted || disposed || staleAlert(job)) return;
     const url = URL.createObjectURL(blob);
     const audio = new Audio(url);
@@ -325,7 +349,7 @@
       <label>Voice name<input bind:value={voiceName} maxlength="100" placeholder="Name your cloned voice" /></label>
       <button disabled={busy || libraryBusy || !reference || !voiceName.trim()} onclick={() => void saveVoice()}>Create shared voice</button>
     </details>
-    <label>Preview text<input bind:value={previewText} /></label>
+    <label>Preview text<textarea class="preview-text" rows="4" bind:value={previewText}></textarea></label>
     <div class="buttons">
       <button disabled={(busy && !speechWorkerRunning) || (voice === 'draft' && !reference) || !previewText.trim()} onclick={preview}>{speechWorkerRunning ? 'Queue TTS' : 'Play TTS'}</button>
       <button onclick={cancel}>Cancel speech</button>
@@ -358,6 +382,7 @@
   .clone-editor > summary, .server-settings > summary { cursor: pointer; font-size: 12px; color: #b8cae4; }
   .clone-editor > :not(summary), .server-settings label { margin-top: 12px; }
   .voice-content textarea { min-height: 110px; height: 110px; }
+  .voice-content textarea.preview-text { min-height: 150px; height: 150px; line-height: 1.8; font-family: inherit; }
   .voice-content audio { display: block; width: 100%; min-width: 0; }
   .microphone { display: inline-flex; justify-content: center; align-items: center; width: 38px; height: 38px; padding: 8px; flex-shrink: 0; }
   .microphone.recording { color: #ff566e; border-color: #ff566e; }
