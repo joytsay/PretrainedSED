@@ -92,6 +92,7 @@ services:
         exec /app/audiocpp_server --config /app/sed-server.json
     volumes:
       - audio-models:/app/models
+      - audio-voices:/app/voices
       - ../docker/audiocpp/server.json:/app/sed-server.json:ro
     healthcheck:
       test: [CMD, curl, -fsS, http://127.0.0.1:8081/health]
@@ -103,3 +104,4 @@ services:
 
 volumes:
   audio-models:
+  audio-voices:

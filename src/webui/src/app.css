@@ -67,11 +67,12 @@ main { max-width:1500px; min-width:0; margin:auto; padding:22px }
 .video-shell { position:relative; min-height:300px; overflow:hidden; border:1px solid #263e5e; border-radius:8px; background:#02060b }
 video { display:block; width:100%; max-height:58vh; min-height:300px; object-fit:contain; background:#02060b }
 .empty-video { position:absolute; inset:0; display:grid; place-items:center; color:var(--muted); pointer-events:none }
-.controls-grid { display:grid; grid-template-columns:minmax(150px,1fr) minmax(200px,1fr) 120px auto; gap:9px; align-items:end; margin-top:12px }
+.controls-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,160px),1fr)); gap:9px; align-items:end; margin-top:12px }
+.controls-grid>label { min-width:0 }.controls-grid input { display:block; min-width:0; margin-left:0; margin-right:0 }
 label { display:block; color:#b8cae4; font-size:11px; font-weight:700 }
 input,textarea { width:100%; margin-top:5px; padding:8px 10px; border:1px solid #2a405f; border-radius:8px; outline:none; color:#edf5ff; background:#081426 }
 input:focus,textarea:focus { border-color:var(--blue); box-shadow:0 0 0 3px rgba(106,168,255,.12) } input[type="range"] { padding:0; accent-color:#62d8c8 }
-.visualization-toggle { min-height:35px; display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid #2a405f; border-radius:8px; background:#081426; cursor:pointer; white-space:nowrap }
+.visualization-toggle { min-height:35px; display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid #2a405f; border-radius:8px; background:#081426; cursor:pointer; white-space:normal }
 .visualization-toggle input { width:15px; height:15px; margin:0; padding:0; accent-color:#55d9ca; cursor:pointer }
 .visualization-toggle span { color:#c8d9ef }
 .sed-visualization { margin-top:12px; padding:12px; border:1px solid #263e5e; border-radius:9px; background:#050d19 }

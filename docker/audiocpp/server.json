@@ -25,6 +25,14 @@
       "mode": "offline",
       "load_options": {
         "language": "english"
+      },
+      "voice_presets": {
+        "woman": {
+          "voice_id": "alba"
+        },
+        "man": {
+          "voice_ref": "/app/preset-voices/man.wav"
+        }
       }
     },
     {
@@ -35,8 +43,17 @@
       "mode": "offline",
       "load_options": {
         "language": "french"
+      },
+      "voice_presets": {
+        "woman": {
+          "voice_id": "cosette"
+        },
+        "man": {
+          "voice_ref": "/app/preset-voices/man.wav"
+        }
       }
     }
   ],
-  "cors_origins": "*"
+  "cors_origins": "*",
+  "voice_dir": "/app/voices"
 }

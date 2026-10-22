@@ -397,18 +397,25 @@ Inspect startup with `docker compose -f src/compose.yaml --profile audio logs -f
 To stop a previously enabled audio service, run
 `docker compose -f src/compose.yaml --profile audio stop voice-ai`.
 
-Open **Voice cloning & spoken alerts** below the confidence panel. Upload a
-short single-speaker recording or record one (microphone requires localhost or
-HTTPS), review its automatic transcript, and use **Play TTS** to check the voice
-and permit audio playback. Enable spoken alerts to read the exact mapped
+Open **Voice cloning & spoken alerts** below the confidence panel. Choose a
+woman or man preset without uploading a reference, or upload/record a short
+single-speaker reference (microphone requires localhost or HTTPS). The woman
+preset uses PocketTTS Alba (English) or Cosette (French); the man preset uses
+audio.cpp's bundled male reference. Name the reference and select **Create
+shared voice** to save it on the server. Saved voices appear in every client
+after refresh; **Delete shared voice** removes the selected clone globally.
+Use **Play TTS** to check the selected voice and permit audio playback. Enable spoken alerts to read the exact mapped
 `class_name` once when confidence rises above the threshold. A class rearms when
 its confidence falls to or below the threshold. Simultaneous alerts play in
-sequence. During speech the media output drops to 20% of its current level;
+sequence. Parenthetical class details are spoken too, with pauses between
+slash-separated sounds. The **Media volume during speech** slider controls
+playback volume from 0–100% of its current level, defaulting to 20%;
 the detector still receives the original signal. Completion, cancellation,
 playback failure, and stream shutdown restore normal output.
 
 The API URL defaults to the browser's current hostname on port 8091 (`/v1`).
 Change it for a remote server. HTTPS pages require an HTTPS audio.cpp URL.
 The MVP allows cross-origin requests and exposes a model-management API;
-run it on a trusted network. Voice recordings and transcripts remain in the
-current tab; upload again after reload.
+run it on a trusted network. Saved recordings and transcripts persist in the
+`audio-voices` Docker volume across container recreation. Unsaved references
+remain in the current tab.

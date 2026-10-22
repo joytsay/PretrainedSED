@@ -70,9 +70,11 @@
   let realtimeContext: AudioContext | null = null;
   let playbackGain: GainNode | null = null;
   let speechDucking = false;
-  function duckMedia(speaking: boolean): void {
+  let speechVolumePercent = 20;
+  function duckMedia(speaking: boolean, volumePercent: number): void {
+    speechVolumePercent = volumePercent;
     speechDucking = speaking;
-    if (playbackGain) playbackGain.gain.value = speaking ? 0.2 : 1;
+    if (playbackGain) playbackGain.gain.value = speaking ? speechVolumePercent / 100 : 1;
   }
   let realtimeSource: MediaElementAudioSourceNode | null = null;
   let realtimeProcessor: ScriptProcessorNode | null = null;
@@ -719,7 +721,7 @@
       // implementations produce a silent ScriptProcessor output until its
       // output buffer is explicitly filled.
       playbackGain = realtimeContext.createGain();
-      playbackGain.gain.value = speechDucking ? 0.2 : 1;
+      playbackGain.gain.value = speechDucking ? speechVolumePercent / 100 : 1;
       realtimeSource.connect(playbackGain);
       playbackGain.connect(realtimeContext.destination);
       // Keep normal video playback audible while copying its audio to packets.

@@ -134,7 +134,9 @@ COPY --from=audiocpp-source model_specs/ /app/model_specs/
 COPY --from=audiocpp-source assets/framework/models/ /app/assets/framework/models/
 COPY --from=audiocpp-source tools/model_manager_v2.py /app/tools/model_manager_v2.py
 
-RUN mkdir -p /app/models && chown ubuntu:ubuntu /app/models
+COPY --from=build /app/webui/native/demo_voices/demo_1_man.wav /app/preset-voices/man.wav
+
+RUN mkdir -p /app/models /app/voices && chown ubuntu:ubuntu /app/models /app/voices
 
 USER ubuntu
 
