@@ -176,7 +176,7 @@ Merci de votre coopération.`
     referenceUrl = '';
     transcript = '';
     voice = 'woman';
-    voiceName = file?.name.replace(/\.[^.]+$/, '') || '';
+    if (!voiceName.trim()) voiceName = file?.name.replace(/\.[^.]+$/, '') || '';
     if (!file) return;
     busy = true;
     status = 'Normalizing reference voice…';
@@ -281,6 +281,12 @@ Merci de votre coopération.`
         throw new Error('Microphone recording requires HTTPS with a trusted certificate, or localhost.');
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       if (disposed) { stream.getTracks().forEach(track => track.stop()); return; }
+      const startedAt = new Date();
+      const pad = (value: number) => String(value).padStart(2, '0');
+      const date = `${startedAt.getFullYear()}-${pad(startedAt.getMonth() + 1)}-${pad(startedAt.getDate())}`;
+      const time = `${pad(startedAt.getHours())}-${pad(startedAt.getMinutes())}-${pad(startedAt.getSeconds())}`;
+      const language = ttsModel === 'pocket-french' ? 'fr' : 'en';
+      const filename = `${language}-mic-${date}-${time}.webm`;
       const chunks: Blob[] = [];
       recorder = new MediaRecorder(stream);
       recorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data); };
@@ -288,7 +294,7 @@ Merci de votre coopération.`
         const type = recorder?.mimeType || 'audio/webm';
         stream?.getTracks().forEach(track => track.stop());
         recording = false; busy = false;
-        if (!disposed) void choose(new File(chunks, 'reference.webm', { type }));
+        if (!disposed) void choose(new File(chunks, filename, { type }));
       };
       recorder.start(); recording = true;
     } catch (error) { stream?.getTracks().forEach(track => track.stop()); status = String(error); busy = false; }
