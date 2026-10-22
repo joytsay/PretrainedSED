@@ -414,7 +414,8 @@ its confidence falls to or below the threshold. Simultaneous alerts play in
 sequence through one synthesis/playback queue. Each utterance finishes before
 the next starts, including across media stream restarts; only explicit
 cancellation or leaving the page interrupts playback. Previews join the same
-queue. Speech plays at 2× speed with pitch preserved. When media ends, pending
+queue. The **TTS speed** slider adjusts playback from 0.5× to 2×, defaulting to
+1.5× with pitch preserved. Speed changes apply during playback too. When media ends, pending
 detector alerts are discarded, including an alert still being generated; an
 utterance already playing finishes. Parenthetical class details are spoken too, with pauses between
 slash-separated sounds. The **Media volume during speech** slider controls

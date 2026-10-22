@@ -7,6 +7,7 @@
   export let duck: (speaking: boolean, volumePercent: number) => void;
   let duckPercent = 20;
   let ttsVolumePercent = 100;
+  let ttsSpeed = 1.5;
   let speaking = false;
   $: duck(speaking, duckPercent);
   let enabled = false;
@@ -31,6 +32,10 @@
   let controller: AbortController | null = null;
   let player: HTMLAudioElement | null = null;
   $: if (player) player.volume = ttsVolumePercent / 100;
+  $: if (player) {
+    player.defaultPlaybackRate = ttsSpeed;
+    player.playbackRate = ttsSpeed;
+  }
   let finishPlayback: (() => void) | null = null;
   let previous = new Set<string>();
   type SpeechJob = { text: string; kind: 'alert' | 'preview'; generation: number };
@@ -197,8 +202,8 @@
     const url = URL.createObjectURL(blob);
     const audio = new Audio(url);
     audio.volume = ttsVolumePercent / 100;
-    audio.defaultPlaybackRate = 2;
-    audio.playbackRate = 2;
+    audio.defaultPlaybackRate = ttsSpeed;
+    audio.playbackRate = ttsSpeed;
     audio.preservesPitch = true;
     player = audio;
     try {
@@ -279,6 +284,7 @@
     <label class="alert-toggle"><input type="checkbox" bind:checked={enabled} /><span>Speak class names on threshold crossing</span></label>
     <label class="volume-control"><span>Media volume during speech <output>{duckPercent}%</output></span><input aria-label="Media volume during speech" type="range" min="0" max="100" step="1" bind:value={duckPercent} /></label>
     <label class="volume-control"><span>TTS volume <output>{ttsVolumePercent}%</output></span><input aria-label="TTS volume" type="range" min="0" max="100" step="1" bind:value={ttsVolumePercent} /></label>
+    <label class="volume-control"><span>TTS speed <output>{ttsSpeed.toFixed(1)}×</output></span><input aria-label="TTS speed" type="range" min="0.5" max="2" step="0.1" bind:value={ttsSpeed} /></label>
     <div class="voice-fields">
       <label>Speech language<select aria-label="Speech language" bind:value={ttsModel} disabled={busy}>
         <option value="pocket-english">English</option>
