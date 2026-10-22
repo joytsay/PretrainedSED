@@ -30,21 +30,28 @@
   let player: HTMLAudioElement | null = null;
   let finishPlayback: (() => void) | null = null;
   let previous = new Set<string>();
-  let queue: string[] = [];
+  type SpeechJob = { text: string; kind: 'alert' | 'preview' };
+  let queue: SpeechJob[] = [];
+  let speechWorkerRunning = false;
   let disposed = false;
   let alertSessionActive = false;
   $: observe(triggered, enabled, active);
+  $: if (!busy && queue.length && !disposed) void drain();
 
   function observe(names: string[], on: boolean, playing: boolean) {
-    const wasActive = alertSessionActive;
     alertSessionActive = on && playing;
     const next = new Set(alertSessionActive ? names : []);
-    for (const name of next) if (!previous.has(name) && !queue.includes(name)) queue.push(name);
+    for (const name of next) {
+      if (!previous.has(name) && !queue.some(job => job.kind === 'alert' && job.text === name))
+        queue = [...queue, { text: name, kind: 'alert' }];
+    }
     previous = next;
-    if (!alertSessionActive) { queue = []; if (wasActive) cancel(); }
+    // Stream restarts and threshold changes must never interrupt current speech.
+    if (!alertSessionActive) queue = queue.filter(job => job.kind !== 'alert');
     else void drain();
   }
   function cancel() {
+    queue = [];
     controller?.abort();
     player?.pause();
     finishPlayback?.();
@@ -178,18 +185,27 @@
     }
   }
   async function drain() {
-    if (busy || disposed) return;
+    // One worker owns both synthesis and playback, including queued previews.
+    if (speechWorkerRunning || busy || disposed) return;
+    speechWorkerRunning = true;
     busy = true;
-    try { while (queue.length && enabled && active && !disposed) await speak(queue.shift()!); }
-    catch (error) { if (!controller?.signal.aborted) status = String(error); queue = []; }
-    finally { busy = false; }
+    try {
+      while (queue.length && !disposed) {
+        const [job, ...remaining] = queue;
+        queue = remaining;
+        if (job.kind === 'alert' && !alertSessionActive) continue;
+        try { await speak(job.text); }
+        catch (error) { if (!controller?.signal.aborted) status = String(error); }
+      }
+    } finally {
+      speechWorkerRunning = false;
+      busy = false;
+    }
   }
-  async function preview() {
-    if (busy) return;
-    busy = true;
-    try { await speak(previewText); }
-    catch (error) { if (!controller?.signal.aborted) status = String(error); }
-    finally { busy = false; }
+  function preview() {
+    if ((busy && !speechWorkerRunning) || !previewText.trim()) return;
+    queue = [...queue, { text: previewText, kind: 'preview' }];
+    void drain();
   }
   async function record() {
     if (recording) { recorder?.stop(); return; }
@@ -261,7 +277,7 @@
     </details>
     <label>Preview text<input bind:value={previewText} /></label>
     <div class="buttons">
-      <button disabled={busy || (voice === 'draft' && !reference) || !previewText.trim()} onclick={() => void preview()}>Play TTS</button>
+      <button disabled={(busy && !speechWorkerRunning) || (voice === 'draft' && !reference) || !previewText.trim()} onclick={preview}>{speechWorkerRunning ? 'Queue TTS' : 'Play TTS'}</button>
       <button onclick={cancel}>Cancel speech</button>
     </div>
     <details class="server-settings">
@@ -269,7 +285,7 @@
       <label>audio.cpp API URL<input bind:value={base} onchange={() => { voices = []; voice = 'woman'; void refreshVoices(); }} placeholder="http://hostname:8091/v1" disabled={busy} /></label>
       <label>STT model<input bind:value={sttModel} disabled={busy} /></label>
     </details>
-    {#if status}<p class="voice-status" role="status">{status}</p>{/if}
+    {#if status}<p class="voice-status" role="status">{status}{#if queue.length} · {queue.length} queued{/if}</p>{/if}
   </div>
 </details>
 

@@ -1,0 +1,20 @@
+Fantine English voice reference
+
+File: fantine.wav (unmodified p244_023_enhanced.wav)
+Source: https://huggingface.co/kyutai/tts-voices/resolve/main/vctk/p244_023_enhanced.wav
+Preset mapping: https://github.com/kyutai-labs/pocket-tts/blob/main/pocket_tts/utils/utils.py
+
+Original recording: speaker p244, sentence 023, microphone 1, VCTK corpus.
+VCTK creators: Junichi Yamagishi, Christophe Veaux, and Kirsten MacDonald.
+Published by the University of Edinburgh, Centre for Speech Technology Research.
+VCTK corpus: https://datashare.ed.ac.uk/handle/10283/3443
+DOI: https://doi.org/10.7488/ds/2645
+License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+https://creativecommons.org/licenses/by/4.0/
+
+The cleaned recording is distributed by Kyutai; its voice repository credits
+ai-coustics for enhancement:
+https://huggingface.co/kyutai/tts-voices/blob/main/README.md
+
+SED uses this recording as a PocketTTS speaker reference. The recording has
+not been modified by this project. Generated speech is not the original speaker.

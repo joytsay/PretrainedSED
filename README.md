@@ -400,14 +400,17 @@ To stop a previously enabled audio service, run
 Open **Voice cloning & spoken alerts** below the confidence panel. Choose a
 woman or man preset without uploading a reference, or upload/record a short
 single-speaker reference (microphone requires localhost or HTTPS). The woman
-preset uses PocketTTS Alba (English) or Cosette (French); the man preset uses
+preset uses the bundled Fantine reference (English) or Cosette (French); the man preset uses
 audio.cpp's bundled male reference. Name the reference and select **Create
 shared voice** to save it on the server. Saved voices appear in every client
 after refresh; **Delete shared voice** removes the selected clone globally.
 Use **Play TTS** to check the selected voice and permit audio playback. Enable spoken alerts to read the exact mapped
 `class_name` once when confidence rises above the threshold. A class rearms when
 its confidence falls to or below the threshold. Simultaneous alerts play in
-sequence. Parenthetical class details are spoken too, with pauses between
+sequence through one synthesis/playback queue. Each utterance finishes before
+the next starts, including across media stream restarts; only explicit
+cancellation or leaving the page interrupts playback. Previews join the same
+queue. Parenthetical class details are spoken too, with pauses between
 slash-separated sounds. The **Media volume during speech** slider controls
 playback volume from 0–100% of its current level, defaulting to 20%;
 the detector still receives the original signal. Completion, cancellation,

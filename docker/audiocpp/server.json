@@ -28,7 +28,7 @@
       },
       "voice_presets": {
         "woman": {
-          "voice_id": "alba"
+          "voice_ref": "/app/preset-voices/fantine.wav"
         },
         "man": {
           "voice_ref": "/app/preset-voices/man.wav"
