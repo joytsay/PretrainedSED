@@ -414,7 +414,9 @@ its confidence falls to or below the threshold. Simultaneous alerts play in
 sequence through one synthesis/playback queue. Each utterance finishes before
 the next starts, including across media stream restarts; only explicit
 cancellation or leaving the page interrupts playback. Previews join the same
-queue. Parenthetical class details are spoken too, with pauses between
+queue. Speech plays at 2× speed with pitch preserved. When media ends, pending
+detector alerts are discarded, including an alert still being generated; an
+utterance already playing finishes. Parenthetical class details are spoken too, with pauses between
 slash-separated sounds. The **Media volume during speech** slider controls
 playback volume from 0–100% of its current level, defaulting to 20%;
 the detector still receives the original signal. Completion, cancellation,

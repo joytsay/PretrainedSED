@@ -54,6 +54,7 @@
   let status = 'Connecting to callback worker…';
   let statusKind: '' | 'error' | 'warning' = '';
   let eventSequence = 0;
+  let mediaGeneration = 0;
   let streamId: number | null = null;
   let nextPacketTimestamp = 0;
   let requestCounter = 0;
@@ -915,6 +916,8 @@
   }
 
   async function handleEnded(): Promise<void> {
+    // Invalidate alerts before the playlist starts another media item.
+    mediaGeneration += 1;
     if (debugMode && debugRunning) {
       debugCompletedMedia += 1;
       console.info('[SED debug] media completed', { completedMedia: debugCompletedMedia, media: `${currentIndex + 1}/${playlist.length}`, name: currentItem?.name });
@@ -1315,7 +1318,7 @@
       </div>
       </section>
 
-      <VoiceAlerts triggered={triggeredScores.map(item => item.name)} active={streamId !== null} duck={duckMedia} />
+      <VoiceAlerts triggered={triggeredScores.map(item => item.name)} active={streamId !== null} {mediaGeneration} duck={duckMedia} />
 
       <details class="panel mapping-panel">
         <summary class="mapping-summary"><strong>Class Mapping</strong><small>{mappingClasses.length} aggregate labels</small></summary>

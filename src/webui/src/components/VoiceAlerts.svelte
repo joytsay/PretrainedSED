@@ -3,6 +3,7 @@
   import { boostSpeechVolume, browserDecodeToWav } from './audio';
   export let triggered: string[] = [];
   export let active = false;
+  export let mediaGeneration = 0;
   export let duck: (speaking: boolean, volumePercent: number) => void;
   let duckPercent = 20;
   let ttsVolumePercent = 100;
@@ -32,20 +33,33 @@
   $: if (player) player.volume = ttsVolumePercent / 100;
   let finishPlayback: (() => void) | null = null;
   let previous = new Set<string>();
-  type SpeechJob = { text: string; kind: 'alert' | 'preview' };
+  type SpeechJob = { text: string; kind: 'alert' | 'preview'; generation: number };
+  let currentJob: SpeechJob | null = null;
+  let observedGeneration = mediaGeneration;
   let queue: SpeechJob[] = [];
   let speechWorkerRunning = false;
   let disposed = false;
   let alertSessionActive = false;
-  $: observe(triggered, enabled, active);
+  $: observe(triggered, enabled, active, mediaGeneration);
   $: if (!busy && queue.length && !disposed) void drain();
 
-  function observe(names: string[], on: boolean, playing: boolean) {
+  function observe(names: string[], on: boolean, playing: boolean, generation: number) {
     alertSessionActive = on && playing;
+    const mediaChanged = generation !== observedGeneration;
+    observedGeneration = generation;
+    if (!alertSessionActive || mediaChanged) {
+      queue = queue.filter(job => job.kind !== 'alert');
+      // Finish audible speech, but discard an alert still waiting for synthesis.
+      if (currentJob?.kind === 'alert' && !player) {
+        controller?.abort();
+        status = 'Ready';
+      }
+    }
+    if (mediaChanged) { previous = new Set(names); return; }
     const next = new Set(alertSessionActive ? names : []);
     for (const name of next) {
       if (!previous.has(name) && !queue.some(job => job.kind === 'alert' && job.text === name))
-        queue = [...queue, { text: name, kind: 'alert' }];
+        queue = [...queue, { text: name, kind: 'alert', generation }];
     }
     previous = next;
     // Stream restarts and threshold changes must never interrupt current speech.
@@ -157,7 +171,12 @@
     } catch (error) { if (!aborter.signal.aborted) status = String(error); }
     finally { busy = false; }
   }
-  async function speak(text: string) {
+  function staleAlert(job: SpeechJob): boolean {
+    return job.kind === 'alert' && (!alertSessionActive || job.generation !== mediaGeneration);
+  }
+  async function speak(job: SpeechJob) {
+    if (staleAlert(job)) return;
+    const { text } = job;
     const aborter = new AbortController(); controller = aborter;
     status = `Generating: ${text}`;
     const boostFrenchWoman = ttsModel === 'pocket-french' && voice === 'woman';
@@ -172,12 +191,15 @@
     }
     const response = await request('audio/speech', JSON.stringify(body), aborter.signal);
     let blob = await response.blob();
-    if (aborter.signal.aborted || disposed) return;
+    if (aborter.signal.aborted || disposed || staleAlert(job)) return;
     if (boostFrenchWoman) blob = await boostSpeechVolume(blob);
-    if (aborter.signal.aborted || disposed) return;
+    if (aborter.signal.aborted || disposed || staleAlert(job)) return;
     const url = URL.createObjectURL(blob);
     const audio = new Audio(url);
     audio.volume = ttsVolumePercent / 100;
+    audio.defaultPlaybackRate = 2;
+    audio.playbackRate = 2;
+    audio.preservesPitch = true;
     player = audio;
     try {
       await new Promise<void>((resolve, reject) => {
@@ -202,9 +224,11 @@
       while (queue.length && !disposed) {
         const [job, ...remaining] = queue;
         queue = remaining;
-        if (job.kind === 'alert' && !alertSessionActive) continue;
-        try { await speak(job.text); }
+        if (staleAlert(job)) continue;
+        currentJob = job;
+        try { await speak(job); }
         catch (error) { if (!controller?.signal.aborted) status = String(error); }
+        finally { currentJob = null; }
       }
     } finally {
       speechWorkerRunning = false;
@@ -213,7 +237,7 @@
   }
   function preview() {
     if ((busy && !speechWorkerRunning) || !previewText.trim()) return;
-    queue = [...queue, { text: previewText, kind: 'preview' }];
+    queue = [...queue, { text: previewText, kind: 'preview', generation: mediaGeneration }];
     void drain();
   }
   async function record() {
