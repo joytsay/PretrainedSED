@@ -1,0 +1,20 @@
+{
+	auto_https disable_redirects
+	skip_install_trust
+	# Match audio.cpp's working LAN HTTPS setup for clients connecting by IP.
+	default_sni {$PSED_HTTPS_HOST:192.168.5.151}
+}
+
+https://{$PSED_HTTPS_HOST:192.168.5.151}:443 {
+	tls internal
+
+	# The browser uses the same HTTPS origin for STT, TTS, and shared voices.
+	# /audio/v1/... becomes /v1/... on audio.cpp.
+	handle_path /audio/* {
+		reverse_proxy {$PSED_AUDIO_UPSTREAM:voice-ai:8081}
+	}
+
+	handle {
+		reverse_proxy sed:8080
+	}
+}

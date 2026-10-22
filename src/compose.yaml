@@ -50,6 +50,24 @@ services:
           --host 0.0.0.0 \
           --port 8080
 
+  caddy:
+    image: caddy:2.11.4-alpine
+    depends_on:
+      sed:
+        condition: service_started
+    restart: unless-stopped
+    ports:
+      - "${PSED_HTTPS_PORT:-8443}:443"
+    environment:
+      PSED_HTTPS_HOST: ${PSED_HTTPS_HOST:-192.168.5.151}
+      PSED_AUDIO_UPSTREAM: ${PSED_AUDIO_UPSTREAM:-voice-ai:8081}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
   # Adapted from audio.cpp AGX Compose for STT and TTS only.
   voice-ai:
     profiles: [audio]
@@ -105,3 +123,5 @@ services:
 volumes:
   audio-models:
   audio-voices:
+  caddy-data:
+  caddy-config:

@@ -58,7 +58,9 @@
     speaking = false;
   }
   async function api(path: string, options: RequestInit = {}) {
-    const endpoint = (base.trim() || `${location.protocol}//${location.hostname}:8091/v1`).replace(/\/$/, '');
+    const defaultEndpoint = new URL('/audio/v1', location.origin);
+    if (location.protocol !== 'https:') { defaultEndpoint.port = '8091'; defaultEndpoint.pathname = '/v1'; }
+    const endpoint = (base.trim() || defaultEndpoint.toString()).replace(/\/$/, '');
     const response = await fetch(`${endpoint}/${path}`, {
       ...options,
       signal: AbortSignal.any([AbortSignal.timeout(180000), ...(options.signal ? [options.signal] : [])])
@@ -211,6 +213,8 @@
     if (recording) { recorder?.stop(); return; }
     busy = true;
     try {
+      if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia)
+        throw new Error('Microphone recording requires HTTPS with a trusted certificate, or localhost.');
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       if (disposed) { stream.getTracks().forEach(track => track.stop()); return; }
       const chunks: Blob[] = [];
@@ -282,7 +286,7 @@
     </div>
     <details class="server-settings">
       <summary>Server settings</summary>
-      <label>audio.cpp API URL<input bind:value={base} onchange={() => { voices = []; voice = 'woman'; void refreshVoices(); }} placeholder="http://hostname:8091/v1" disabled={busy} /></label>
+      <label>audio.cpp API URL<input bind:value={base} onchange={() => { voices = []; voice = 'woman'; void refreshVoices(); }} placeholder="Automatic (same origin over HTTPS)" disabled={busy} /></label>
       <label>STT model<input bind:value={sttModel} disabled={busy} /></label>
     </details>
     {#if status}<p class="voice-status" role="status">{status}{#if queue.length} · {queue.length} queued{/if}</p>{/if}

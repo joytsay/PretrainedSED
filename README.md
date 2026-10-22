@@ -416,9 +416,47 @@ playback volume from 0–100% of its current level, defaulting to 20%;
 the detector still receives the original signal. Completion, cancellation,
 playback failure, and stream shutdown restore normal output.
 
-The API URL defaults to the browser's current hostname on port 8091 (`/v1`).
-Change it for a remote server. HTTPS pages require an HTTPS audio.cpp URL.
+On HTTPS, the voice API defaults to the same origin at `/audio/v1` through
+Caddy. On HTTP, it defaults to the browser's current hostname on port 8091
+(`/v1`). Leave the API URL blank for automatic routing, or supply an HTTPS
+API URL for a remote server.
 The MVP allows cross-origin requests and exposes a model-management API;
 run it on a trusted network. Saved recordings and transcripts persist in the
 `audio-voices` Docker volume across container recreation. Unsaved references
 remain in the current tab.
+
+
+### HTTPS and microphone recording
+
+Caddy starts with the SED stack on port **8443**, separate from the standalone
+audio.cpp stack's HTTPS port. Set `PSED_HTTPS_HOST` in `src/.env` to the server's
+LAN IP or DNS name that your browser will use (default: `192.168.5.151`,
+matching audio.cpp's AGX Caddyfile). Then run:
+
+```sh
+docker compose -f src/compose.yaml --profile audio up --build -d
+```
+
+Open `https://192.168.5.151:8443`, or use the address configured in
+`PSED_HTTPS_HOST`.
+Caddy serves the SED UI and proxies `/audio/v1/*` to audio.cpp, so microphone
+recording, transcription, speech, and the voice library use the same HTTPS
+origin. Keep the voice API URL blank for this routing. Override the host port
+with `PSED_HTTPS_PORT` if needed.
+
+Caddy issues a local certificate. Export its root certificate after startup:
+
+```sh
+docker compose -f src/compose.yaml cp caddy:/data/caddy/pki/authorities/local/root.crt ./sed-caddy-root.crt
+```
+
+Import `sed-caddy-root.crt` as a trusted certificate authority on **each client
+device/browser** that will record audio, then reopen the HTTPS URL and allow
+microphone access. The address must match `PSED_HTTPS_HOST`; bypassing a browser
+certificate warning is not a substitute for trusting the CA. Caddy's CA and
+certificates persist in the `caddy-data` volume.
+
+SED without `--profile audio` still has HTTPS. To proxy to an already running
+audio.cpp stack on the Docker host, set
+`PSED_AUDIO_UPSTREAM=host.docker.internal:8081` before starting Compose.
+The existing audio.cpp server must provide the STT/TTS model IDs used by SED.
