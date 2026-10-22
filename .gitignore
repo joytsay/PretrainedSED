@@ -210,3 +210,7 @@ cache/
 
 # Shared non-secret Compose defaults for the optional audio.cpp profile.
 !src/.env
+
+# Keep the complete vendored audio.cpp build inputs, including native headers.
+!docker/audiocpp/source/
+!docker/audiocpp/source/**

@@ -1,4 +1,4 @@
-# Audio-only CUDA image. The named source context is the audio.cpp checkout.
+# Audio-only CUDA image built from the native source snapshot in source/.
 # No embedded WebUI build, Node, prompt data, llama.cpp, or RAG workers.
 ARG UBUNTU_VERSION=24.04
 ARG CUDA_VERSION=12.9.2
@@ -37,18 +37,18 @@ ARG CUDA_DOCKER_ARCH=default
 WORKDIR /app
 # Keep dependency sources in a stable layer when application/UI files change.
 # Copy only native build inputs here; SIP and WebUI sources have their own stages.
-COPY --from=audiocpp-source external/ ./external/
-COPY --from=audiocpp-source include/ ./include/
-COPY --from=audiocpp-source src/ ./src/
-COPY --from=audiocpp-source app/ ./app/
-COPY --from=audiocpp-source tools/ ./tools/
-COPY --from=audiocpp-source model_specs/ ./model_specs/
-COPY --from=audiocpp-source assets/ ./assets/
+COPY source/external/ ./external/
+COPY source/include/ ./include/
+COPY source/src/ ./src/
+COPY source/app/ ./app/
+COPY source/tools/ ./tools/
+COPY source/model_specs/ ./model_specs/
+COPY source/assets/ ./assets/
 # model_perf is an unconditional release target, despite living under tests/.
-COPY --from=audiocpp-source tests/perf/ ./tests/perf/
-COPY --from=audiocpp-source CMakeLists.txt ./
-COPY --from=audiocpp-source .devops/entrypoint.sh ./.devops/entrypoint.sh
-COPY --from=audiocpp-source webui/native/demo_voices/ ./webui/native/demo_voices/
+COPY source/tests/perf/ ./tests/perf/
+COPY source/CMakeLists.txt ./
+COPY source/.devops/entrypoint.sh ./.devops/entrypoint.sh
+COPY source/webui/native/demo_voices/ ./webui/native/demo_voices/
 
 RUN --mount=type=cache,target=/app/build,sharing=locked \
     --mount=type=cache,id=audiocpp-cuda-ccache,target=/root/.cache/ccache \
@@ -130,9 +130,10 @@ WORKDIR /app
 FROM base AS full
 
 COPY --from=build /app/full /app
-COPY --from=audiocpp-source model_specs/ /app/model_specs/
-COPY --from=audiocpp-source assets/framework/models/ /app/assets/framework/models/
-COPY --from=audiocpp-source tools/model_manager_v2.py /app/tools/model_manager_v2.py
+COPY source/model_specs/ /app/model_specs/
+COPY source/assets/framework/models/ /app/assets/framework/models/
+COPY source/tools/model_manager_v2.py /app/tools/model_manager_v2.py
+COPY source/LICENSE /app/LICENSE.audio.cpp
 
 COPY --from=build /app/webui/native/demo_voices/demo_1_man.wav /app/preset-voices/man.wav
 COPY voices/ /app/preset-voices/

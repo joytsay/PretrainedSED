@@ -1,0 +1,25 @@
+{
+  "repository": "https://github.com/0xShug0/audio.cpp",
+  "revision": "3f49995a8fb3afc05270a2992952ab8bc393e977",
+  "copied_paths": [
+    "external",
+    "include",
+    "src",
+    "app",
+    "tools",
+    "model_specs",
+    "assets/framework/models",
+    "tests/perf",
+    "webui/native/demo_voices",
+    "CMakeLists.txt",
+    "LICENSE",
+    ".devops/entrypoint.sh"
+  ],
+  "note": "Unmodified native build inputs copied from a clean checkout. No parent repository or submodule checkout is required. STT/TTS weights are installed into the audio-models Docker volume at runtime.",
+  "excluded_names": [
+    ".git",
+    ".gitignore",
+    "__pycache__",
+    "*.pyc"
+  ]
+}

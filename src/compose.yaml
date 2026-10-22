@@ -76,8 +76,6 @@ services:
     build:
       context: ../docker/audiocpp
       dockerfile: Dockerfile
-      additional_contexts:
-        audiocpp-source: ${AUDIOCPP_SOURCE:-../../audio.cpp}
       target: full
       args:
         CUDA_VERSION: ${CUDA_VERSION:?Set CUDA_VERSION to the CUDA release provided by JetPack}

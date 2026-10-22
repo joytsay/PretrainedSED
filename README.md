@@ -378,8 +378,12 @@ started. The audio API is exposed on host port 8091 (container port 8081).
 The container name defaults to `psed-audiocpp`, allowing coexistence with the
 standalone audio.cpp stack. Override with `PSED_AUDIO_PORT` and
 `PSED_AUDIO_CONTAINER_NAME`; if you change the port, update the UI API URL too.
-It uses the sibling `../audio.cpp` source checkout for the build. Set
-`AUDIOCPP_SOURCE` to an absolute path for another checkout.
+The build uses the native audio.cpp source snapshot in
+`docker/audiocpp/source/`; the sibling audio.cpp checkout is no longer needed.
+`docker/audiocpp/UPSTREAM.json` records the upstream revision and copied paths,
+and `source.sha256` records each copied file's checksum. Upstream and bundled
+dependency licenses remain in the snapshot. To verify it, run
+`(cd docker/audiocpp/source && sha256sum -c ../source.sha256 --quiet)`.
 `src/.env` defaults to CUDA 12.6.3; override `CUDA_VERSION` for your JetPack.
 Startup installs Parakeet-TDT v3 0.6B Q8 for French/English STT and PocketTTS
 100M Q8 English and French packages for cloned speech into the persistent
