@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { browserDecodeToWav } from './audio';
+  import { boostSpeechVolume, browserDecodeToWav } from './audio';
   export let triggered: string[] = [];
   export let active = false;
   export let duck: (speaking: boolean, volumePercent: number) => void;
   let duckPercent = 20;
+  let ttsVolumePercent = 100;
   let speaking = false;
   $: duck(speaking, duckPercent);
   let enabled = false;
@@ -28,6 +29,7 @@
   let stream: MediaStream | null = null;
   let controller: AbortController | null = null;
   let player: HTMLAudioElement | null = null;
+  $: if (player) player.volume = ttsVolumePercent / 100;
   let finishPlayback: (() => void) | null = null;
   let previous = new Set<string>();
   type SpeechJob = { text: string; kind: 'alert' | 'preview' };
@@ -158,6 +160,7 @@
   async function speak(text: string) {
     const aborter = new AbortController(); controller = aborter;
     status = `Generating: ${text}`;
+    const boostFrenchWoman = ttsModel === 'pocket-french' && voice === 'woman';
     const body: Record<string, unknown> = { model: ttsModel, input: spokenLabel(text), response_format: 'wav' };
     if (voice === 'woman' || voice === 'man') body.voice = voice;
     else {
@@ -168,10 +171,14 @@
       body.reference_text = saved?.transcript ?? transcript;
     }
     const response = await request('audio/speech', JSON.stringify(body), aborter.signal);
-    const blob = await response.blob();
+    let blob = await response.blob();
+    if (aborter.signal.aborted || disposed) return;
+    if (boostFrenchWoman) blob = await boostSpeechVolume(blob);
     if (aborter.signal.aborted || disposed) return;
     const url = URL.createObjectURL(blob);
-    const audio = new Audio(url); player = audio;
+    const audio = new Audio(url);
+    audio.volume = ttsVolumePercent / 100;
+    player = audio;
     try {
       await new Promise<void>((resolve, reject) => {
         finishPlayback = resolve;
@@ -247,6 +254,7 @@
   <div class="mapping-content voice-content">
     <label class="alert-toggle"><input type="checkbox" bind:checked={enabled} /><span>Speak class names on threshold crossing</span></label>
     <label class="volume-control"><span>Media volume during speech <output>{duckPercent}%</output></span><input aria-label="Media volume during speech" type="range" min="0" max="100" step="1" bind:value={duckPercent} /></label>
+    <label class="volume-control"><span>TTS volume <output>{ttsVolumePercent}%</output></span><input aria-label="TTS volume" type="range" min="0" max="100" step="1" bind:value={ttsVolumePercent} /></label>
     <div class="voice-fields">
       <label>Speech language<select aria-label="Speech language" bind:value={ttsModel} disabled={busy}>
         <option value="pocket-english">English</option>

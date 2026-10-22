@@ -401,7 +401,11 @@ Open **Voice cloning & spoken alerts** below the confidence panel. Choose a
 woman or man preset without uploading a reference, or upload/record a short
 single-speaker reference (microphone requires localhost or HTTPS). The woman
 preset uses the bundled Fantine reference (English) or Cosette (French); the man preset uses
-audio.cpp's bundled male reference. Name the reference and select **Create
+audio.cpp's bundled male reference. The French woman preset gets a +12 dB
+playback boost with peak compression and headroom protection. This speech
+boost is independent of the media-volume slider. The separate **TTS volume**
+slider controls speech playback from 0–100% (default 100%) and updates while
+speech is playing. Name the reference and select **Create
 shared voice** to save it on the server. Saved voices appear in every client
 after refresh; **Delete shared voice** removes the selected clone globally.
 Use **Play TTS** to check the selected voice and permit audio playback. Enable spoken alerts to read the exact mapped

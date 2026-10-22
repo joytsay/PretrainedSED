@@ -92,3 +92,42 @@ export async function browserDecodeToWav(
     await context.close();
   }
 }
+
+/** Raise quiet generated speech, compressing peaks before PCM encoding. */
+export async function boostSpeechVolume(audio: Blob): Promise<Blob> {
+  // Offline processing avoids a second live audio path or autoplay requirement.
+  const decoder = new OfflineAudioContext(1, 1, 24000);
+  const decoded = await decoder.decodeAudioData(await audio.arrayBuffer());
+  // Preserve the final syllable through the compressor's look-ahead delay.
+  const tailFrames = Math.ceil(decoded.sampleRate * 0.02);
+  const offline = new OfflineAudioContext(decoded.numberOfChannels, decoded.length + tailFrames, decoded.sampleRate);
+  const source = offline.createBufferSource();
+  source.buffer = decoded;
+  const gain = offline.createGain();
+  gain.gain.value = 4; // +12 dB before limiting.
+  const compressor = offline.createDynamicsCompressor();
+  compressor.threshold.value = -6;
+  compressor.knee.value = 6;
+  compressor.ratio.value = 12;
+  compressor.attack.value = 0.003;
+  compressor.release.value = 0.08;
+  source.connect(gain);
+  gain.connect(compressor);
+  compressor.connect(offline.destination);
+  source.start();
+  const rendered = await offline.startRendering();
+
+  // Retain headroom even if a transient passes the compressor's attack window.
+  let peak = 0;
+  for (let channel = 0; channel < rendered.numberOfChannels; channel += 1) {
+    for (const sample of rendered.getChannelData(channel)) peak = Math.max(peak, Math.abs(sample));
+  }
+  if (peak > 0.95) {
+    const scale = 0.95 / peak;
+    for (let channel = 0; channel < rendered.numberOfChannels; channel += 1) {
+      const samples = rendered.getChannelData(channel);
+      for (let frame = 0; frame < samples.length; frame += 1) samples[frame] *= scale;
+    }
+  }
+  return encodePcm16Wav(rendered);
+}
