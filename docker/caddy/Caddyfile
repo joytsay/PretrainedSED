@@ -2,10 +2,10 @@
 	auto_https disable_redirects
 	skip_install_trust
 	# Match audio.cpp's working LAN HTTPS setup for clients connecting by IP.
-	default_sni {$PSED_HTTPS_HOST:192.168.5.151}
+	default_sni {$PSED_HTTPS_HOST:192.168.0.80}
 }
 
-https://{$PSED_HTTPS_HOST:192.168.5.151}:443 {
+https://{$PSED_HTTPS_HOST:192.168.0.80}:443, https://localhost:443 {
 	tls internal
 
 	# The browser uses the same HTTPS origin for STT, TTS, and shared voices.

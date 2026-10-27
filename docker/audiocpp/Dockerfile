@@ -1,25 +1,25 @@
 # Audio-only CUDA image built from the native source snapshot in source/.
 # No embedded WebUI build, Node, prompt data, llama.cpp, or RAG workers.
-ARG UBUNTU_VERSION=24.04
-ARG CUDA_VERSION=12.9.2
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
-ARG GCC_VERSION=14
+ARG GCC_VERSION=11
 
-ARG BASE_CUDA_DEV_CONTAINER=docker.io/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
-ARG BASE_CUDA_RUN_CONTAINER=docker.io/nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
+# Share one Jetson development base between compile and runtime stages.
+# Override with a CUDA 12.6 / Ubuntu 22.04 image built by jetson-containers.
+ARG BASE_CUDA_CONTAINER=nvcr.io/nvidia/l4t-jetpack:r36.4.0
 
-FROM ${BASE_CUDA_DEV_CONTAINER} AS build
+FROM ${BASE_CUDA_CONTAINER} AS build
 
-ARG GCC_VERSION=14
+ARG GCC_VERSION=11
 
 # Install build toolchain
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-        gcc-${GCC_VERSION} g++-${GCC_VERSION} cmake ca-certificates ccache
+        gcc-${GCC_VERSION} g++-${GCC_VERSION} cmake ca-certificates ccache \
+        cuda-cudart-dev-12-6
 
 ENV CC=gcc-${GCC_VERSION} CXX=g++-${GCC_VERSION} CUDAHOSTCXX=g++-${GCC_VERSION}
 ENV CCACHE_DIR=/root/.cache/ccache CCACHE_MAXSIZE=10G CCACHE_COMPILERCHECK=content
@@ -28,11 +28,11 @@ ARG AUDIOCPP_VERSION=dev
 ARG AUDIOCPP_MODEL_SET=full
 ARG AUDIOCPP_MODELS=
 ARG AUDIOCPP_CPU_ALL_VARIANTS=ON
-ARG BUILD_JOBS=0
+ARG BUILD_JOBS=1
 # CUDA architectures to compile for.
 # - default = the portable default list from CMakeLists.txt
 # - for a custom arch set build with --build-arg CUDA_DOCKER_ARCH="89-real;...".
-ARG CUDA_DOCKER_ARCH=default
+ARG CUDA_DOCKER_ARCH=87-real
 
 WORKDIR /app
 # Keep dependency sources in a stable layer when application/UI files change.
@@ -50,12 +50,34 @@ COPY source/CMakeLists.txt ./
 COPY source/.devops/entrypoint.sh ./.devops/entrypoint.sh
 COPY source/webui/native/demo_voices/ ./webui/native/demo_voices/
 
+# The cache survives base-image changes: redetect the CUDA toolchain, while
+# retaining target objects and ccache. Explicit -L also covers CMake 3.22 CUDA
+# runtime linkage, which can emit bare -lcudadevrt/-lcudart_static flags.
 RUN --mount=type=cache,target=/app/build,sharing=locked \
     --mount=type=cache,id=audiocpp-cuda-ccache,target=/root/.cache/ccache \
+    set -eu; \
+    psed_cuda_root="$(readlink -f "${CUDAToolkit_ROOT:-/usr/local/cuda}")"; \
+    psed_cuda_static="$(find "${psed_cuda_root}" -name libcudart_static.a -print -quit)"; \
+    if [ -z "${psed_cuda_static}" ]; then \
+        echo "Missing libcudart_static.a: install cuda-cudart-dev-12-6 in the build image" >&2; exit 1; \
+    fi; \
+    psed_cuda_lib="$(dirname "${psed_cuda_static}")"; \
+    if [ ! -f "${psed_cuda_lib}/libcudadevrt.a" ]; then \
+        echo "Missing libcudadevrt.a in ${psed_cuda_lib}: check cuda-cudart-dev-12-6" >&2; exit 1; \
+    fi; \
+    echo "CUDA toolkit: ${psed_cuda_root}; static runtime libraries: ${psed_cuda_lib}"; \
+    mkdir -p build; \
+    rm -f build/CMakeCache.txt; \
+    if [ -d build/CMakeFiles ]; then \
+        find build/CMakeFiles -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -exec rm -rf -- {} +; \
+    fi; \
+    ADDITIONAL_CMAKE_ARGS=""; \
     if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
         ADDITIONAL_CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${CUDA_DOCKER_ARCH}"; \
     fi && \
     cmake -S . -B build \
+        -DCUDAToolkit_ROOT="${psed_cuda_root}" \
+        -DCMAKE_CUDA_COMPILER="${psed_cuda_root}/bin/nvcc" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER_LAUNCHER=ccache \
         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -74,7 +96,8 @@ RUN --mount=type=cache,target=/app/build,sharing=locked \
         -DENGINE_BUILD_TESTS=OFF \
         -DENGINE_BUILD_WARMBENCH=OFF \
         ${ADDITIONAL_CMAKE_ARGS} \
-        -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined && \
+        -DCMAKE_EXE_LINKER_FLAGS="-L${psed_cuda_lib} -Wl,--allow-shlib-undefined" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-L${psed_cuda_lib}" && \
     if [ "${BUILD_JOBS}" = "0" ]; then BUILD_JOBS="$(nproc)"; fi && \
     cmake --build build --parallel "${BUILD_JOBS}" \
         --target audiocpp_cli \
@@ -88,7 +111,7 @@ RUN --mount=type=cache,target=/app/build,sharing=locked \
     cp .devops/entrypoint.sh /app/full/entrypoint.sh && \
     chmod +x /app/full/entrypoint.sh
 
-FROM ${BASE_CUDA_RUN_CONTAINER} AS base
+FROM ${BASE_CUDA_CONTAINER} AS base
 
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A

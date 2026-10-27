@@ -384,7 +384,28 @@ The build uses the native audio.cpp source snapshot in
 and `source.sha256` records each copied file's checksum. Upstream and bundled
 dependency licenses remain in the snapshot. To verify it, run
 `(cd docker/audiocpp/source && sha256sum -c ../source.sha256 --quiet)`.
-`src/.env` defaults to CUDA 12.6.3; override `CUDA_VERSION` for your JetPack.
+The audio build and runtime now share **one** base image,
+`nvcr.io/nvidia/l4t-jetpack:r36.4.0` (Jetson ARM64, CUDA 12.6, Ubuntu 22.04).
+It contains the compiler and runtime; sharing the image avoids a separate
+CUDA runtime-image pull but retains the larger development base in the final
+image. The existing SED, Node build-helper, and Caddy images are separate.
+`BUILD_JOBS` defaults to 1 for the Orin Nano 8GB; the GPU target remains SM 8.7.
+The build explicitly installs `cuda-cudart-dev-12-6`, verifies CUDA static
+runtime archives, and redetects CUDA compiler paths when reusing its build
+cache. Cached target objects and ccache remain available after a failed build.
+
+To use a CUDA 12.6 / Ubuntu 22.04 image built with
+[Jetson Containers](https://github.com/dusty-nv/jetson-containers), build that
+base once on the Jetson, then select it for SED:
+
+```sh
+CUDA_VERSION=12.6 LSB_RELEASE=22.04 jetson-containers build --name=psed-cuda:jp6 cuda:12.6
+AUDIOCPP_BASE_IMAGE=psed-cuda:jp6 docker compose -f src/compose.yaml --profile audio up --build -d
+```
+
+`AUDIOCPP_BASE_IMAGE` sets the same base for both audio.cpp stages. It must
+provide the Jetson CUDA compiler, headers, and runtime libraries; a runtime-only
+image is insufficient. No prebuilt `dustynv/cuda:12.6` tag is assumed.
 Startup installs Parakeet-TDT v3 0.6B Q8 for French/English STT and PocketTTS
 100M Q8 English and French packages for cloned speech into the persistent
 `audio-models` Docker volume before starting the API server.
@@ -448,15 +469,16 @@ remain in the current tab.
 
 Caddy starts with the SED stack on port **8443**, separate from the standalone
 audio.cpp stack's HTTPS port. Set `PSED_HTTPS_HOST` in `src/.env` to the server's
-LAN IP or DNS name that your browser will use (default: `192.168.5.151`,
-matching audio.cpp's AGX Caddyfile). Then run:
+LAN IP or DNS name that your browser will use (default: `192.168.0.80`,
+the configured LAN address). Then run:
 
 ```sh
 docker compose -f src/compose.yaml --profile audio up --build -d
 ```
 
-Open `https://192.168.5.151:8443`, or use the address configured in
-`PSED_HTTPS_HOST`.
+Open `https://192.168.0.80:8443` from the LAN or
+`https://localhost:8443` on the Jetson. Both addresses are served by Caddy.
+Use `PSED_HTTPS_HOST` to change the LAN address.
 Caddy serves the SED UI and proxies `/audio/v1/*` to audio.cpp, so microphone
 recording, transcription, speech, and the voice library use the same HTTPS
 origin. Keep the voice API URL blank for this routing. Override the host port

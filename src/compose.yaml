@@ -59,7 +59,7 @@ services:
     ports:
       - "${PSED_HTTPS_PORT:-8443}:443"
     environment:
-      PSED_HTTPS_HOST: ${PSED_HTTPS_HOST:-192.168.5.151}
+      PSED_HTTPS_HOST: ${PSED_HTTPS_HOST:-192.168.0.80}
       PSED_AUDIO_UPSTREAM: ${PSED_AUDIO_UPSTREAM:-voice-ai:8081}
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -78,16 +78,13 @@ services:
       dockerfile: Dockerfile
       target: full
       args:
-        CUDA_VERSION: ${CUDA_VERSION:?Set CUDA_VERSION to the CUDA release provided by JetPack}
-        UBUNTU_VERSION: ${UBUNTU_VERSION:-22.04}
-        BASE_CUDA_DEV_CONTAINER: ${BASE_CUDA_DEV_CONTAINER:-docker.io/nvidia/cuda:12.6.3-devel-ubuntu22.04}
-        BASE_CUDA_RUN_CONTAINER: ${BASE_CUDA_RUN_CONTAINER:-nvcr.io/nvidia/l4t-cuda:12.6.11-runtime}
+        BASE_CUDA_CONTAINER: ${AUDIOCPP_BASE_IMAGE:-nvcr.io/nvidia/l4t-jetpack:r36.4.0}
         GCC_VERSION: ${GCC_VERSION:-11}
         CUDA_DOCKER_ARCH: ${CUDA_ARCH:-87-real}
         AUDIOCPP_MODEL_SET: custom
         AUDIOCPP_MODELS: parakeet_tdt,pocket_tts
         AUDIOCPP_CPU_ALL_VARIANTS: "OFF"
-        BUILD_JOBS: ${BUILD_JOBS:-2}
+        BUILD_JOBS: ${BUILD_JOBS:-1}
     runtime: nvidia
     ipc: host
     ulimits:
